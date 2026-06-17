@@ -1,0 +1,41 @@
+{
+  "name": "notebooklm-mcp-gateway",
+  "version": "0.0.0",
+  "description": "Unofficial Cloudflare Worker MCP gateway for NotebookLM using a reverse-engineered browser API.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "notebooklm",
+    "cloudflare-workers",
+    "oauth"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev --local --port 8787 --var OAUTH_ISSUER:http://localhost:8787 --var MCP_RESOURCE:http://localhost:8787/mcp --var MCP_AUDIENCE:http://localhost:8787/mcp --var OAUTH_JWT_SIGNING_KEY_B64:b2F1dGgtc2lnbmluZy1rZXktdGhhdC1pcy1sb25nLWVub3VnaC1mb3ItaHMyNTYtdGVzdHM= --var NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= --var CSRF_SIGNING_KEY_B64:Y3NyZi1zaWduaW5nLWtleS10aGF0LWlzLWxvbmctZW5vdWdoLWZvci1oczI1Ni10ZXN0cw==",
+    "test": "vitest run --pool=forks --fileParallelism=false",
+    "typecheck": "tsc --noEmit",
+    "check": "npm test && npm run typecheck"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "jose": "6.2.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260609.1",
+    "@types/node": "25.9.2",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8",
+    "wrangler": "4.86.0"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "workerd": true,
+    "sharp": true
+  }
+}
