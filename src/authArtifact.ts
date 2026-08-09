@@ -118,13 +118,48 @@ function makeEnvelope(
 }
 
 function detectBaseUrl(input: string): NotebookLMCredentialEnvelope["baseUrl"] {
-  if (input.includes("notebooklm.cloud.google.com")) {
-    return "https://notebooklm.cloud.google.com";
-  }
-  if (input.includes("notebook.google.com")) {
-    return "https://notebook.google.com";
+  for (const candidate of [extractCurlRequestUrl(input), extractCurlHeaderValue(input, "origin"), extractCurlHeaderValue(input, "referer")]) {
+    if (!candidate) continue;
+    try {
+      const host = new URL(candidate).hostname;
+      if (host === "notebooklm.cloud.google.com") return "https://notebooklm.cloud.google.com";
+      if (host === "notebook.google.com") return "https://notebook.google.com";
+      if (host === "notebooklm.google.com") return "https://notebooklm.google.com";
+    } catch {
+      // Ignore non-URL header/request values.
+    }
   }
   return "https://notebooklm.google.com";
+}
+
+function extractCurlRequestUrl(input: string): string | undefined {
+  const patterns = [
+    /(?:^|\s)(?:curl\s+)?--url\s+'([^']+)'/i,
+    /(?:^|\s)(?:curl\s+)?--url\s+"([^"]+)"/i,
+    /\bcurl\s+'([^']+)'/i,
+    /\bcurl\s+"([^"]+)"/i,
+    /\bcurl\s+(https:\/\/\S+)/i
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(input);
+    if (match?.[1]?.startsWith("http")) return match[1];
+  }
+  return undefined;
+}
+
+function extractCurlHeaderValue(input: string, name: string): string | undefined {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const patterns = [
+    new RegExp(`(?:^|\\s)-H\\s+'${escaped}:\\s*([^']+)'`, "i"),
+    new RegExp(`(?:^|\\s)-H\\s+"${escaped}:\\s*([^"]+)"`, "i"),
+    new RegExp(`(?:^|\\s)--header\\s+'${escaped}:\\s*([^']+)'`, "i"),
+    new RegExp(`(?:^|\\s)--header\\s+"${escaped}:\\s*([^"]+)"`, "i")
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(input);
+    if (match?.[1]) return match[1].trim();
+  }
+  return undefined;
 }
 
 function looksLikeCopyAsUrl(input: string): boolean {
@@ -206,9 +241,9 @@ function tryParseStorageState(input: string, now: Date): NotebookLMCredentialEnv
     return domain.includes("google.com") || domain.includes("notebooklm") || cookie.name.includes("SID");
   });
   const cookieHeader = relevantCookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
-  const baseUrl = relevantCookies.some((cookie) => (cookie.domain ?? "").includes("cloud.google.com"))
+  const baseUrl = relevantCookies.some((cookie) => cookieDomainHost(cookie.domain) === "notebooklm.cloud.google.com")
     ? "https://notebooklm.cloud.google.com"
-    : relevantCookies.some((cookie) => (cookie.domain ?? "").includes("notebook.google.com"))
+    : relevantCookies.some((cookie) => cookieDomainHost(cookie.domain) === "notebook.google.com")
       ? "https://notebook.google.com"
       : "https://notebooklm.google.com";
   return makeEnvelope(
@@ -218,6 +253,10 @@ function tryParseStorageState(input: string, now: Date): NotebookLMCredentialEnv
     now,
     state.data.notebooklm?.account?.email
   );
+}
+
+function cookieDomainHost(domain: string | undefined): string {
+  return (domain ?? "").replace(/^\./, "").toLowerCase();
 }
 
 function normalizeCookieHeader(cookieHeader: string): string {

@@ -57,6 +57,21 @@ describe("auth artifact parser", () => {
     expect(parsed.validationRpcId).toBe("ZwVcOc");
   });
 
+  it("detects notebook.google.com from curl --url form", () => {
+    const parsed = parseNotebookLMAuthArtifact(`curl --url 'https://notebook.google.com/_/LabsTailwindUi/data/batchexecute' -b '${sampleCookie}'`);
+    expect(parsed.baseUrl).toBe("https://notebook.google.com");
+  });
+
+  it("does not treat notebook.google.com mentions in body as the request host", () => {
+    const parsed = parseNotebookLMAuthArtifact(`curl 'https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute' -H 'origin: https://notebooklm.google.com' -b '${sampleCookie}' --data-raw 'f.req=https%3A%2F%2Fnotebook.google.com%2Fnotebook%2Fx'`);
+    expect(parsed.baseUrl).toBe("https://notebooklm.google.com");
+  });
+
+  it("detects notebook.google.com from Origin when curl URL is missing a Notebook host", () => {
+    const parsed = parseNotebookLMAuthArtifact(`curl 'https://evil.example/batchexecute' -H 'origin: https://notebook.google.com' -b '${sampleCookie}'`);
+    expect(parsed.baseUrl).toBe("https://notebook.google.com");
+  });
+
   it("rejects Copy-as-URL-looking input", () => {
     expect(() => parseNotebookLMAuthArtifact("https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=wXbhsf")).toThrow("This looks like a URL");
   });

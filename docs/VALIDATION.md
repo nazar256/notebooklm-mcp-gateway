@@ -44,9 +44,9 @@ Before making a repository public, scan for accidental disclosures. At minimum, 
 - browser cookie names and raw cookie values;
 - OAuth/JWT-looking tokens;
 - Copy-as-cURL artifacts;
-- live Worker URLs and deployment IDs;
+- private Cloudflare account/deployment IDs, API tokens, and non-public Worker hostnames;
 - real notebook, source, artifact, or ChatGPT app IDs;
 - local machine paths and user names;
 - private support/debug transcripts.
 
-The public tree should contain only placeholder deployment URLs and synthetic test fixtures.
+Intended public `*.workers.dev` service URLs in `wrangler.jsonc` (OAuth issuer/resource/audience) are expected and not accidental disclosures. Keep secrets and private identifiers out of the tree; use synthetic fixtures in tests.
