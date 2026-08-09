@@ -183,6 +183,48 @@ describe("OAuth", () => {
     expect(html).toContain("Copy as cURL");
   });
 
+  it("authorize GET mentions notebook.google.com rebrand host", async () => {
+    const clientId = await registerClient();
+    const redirectUri = "http://127.0.0.1:3555/callback";
+    const challenge = await pkceS256("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~123");
+    const get = await fetchWorker(`/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&code_challenge=${challenge}&code_challenge_method=S256`);
+    const html = await get.text();
+    expect(html).toContain("https://notebook.google.com");
+    expect(html).toContain("https://notebooklm.google.com");
+  });
+
+  it("authorize POST surfaces NotebookLMError stage when live validation fails", async () => {
+    const clientId = await registerClient();
+    const redirectUri = "http://127.0.0.1:3555/callback";
+    const challenge = await pkceS256("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~123");
+    const get = await fetchWorker(`/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&code_challenge=${challenge}&code_challenge_method=S256`);
+    const csrf = /name="csrf" value="([^"]+)"/.exec(await get.text())?.[1] ?? "";
+    const { MOCK_NOTEBOOKLM_LIST_JSON: _mock, ...liveEnv } = env;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("no wiz", { status: 200 })) as typeof fetch;
+    try {
+      const response = await fetchWorker("/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          response_type: "code",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          csrf,
+          artifact: `curl 'https://notebook.google.com/_/LabsTailwindUi/data/batchexecute' -H 'cookie: ${sampleCookie}'`,
+          ttl_preset_days: "30"
+        })
+      }, liveEnv);
+      const html = await response.text();
+      expect(response.status).toBe(400);
+      expect(html).toContain("NotebookLM rejected the pasted credentials");
+      expect(html).toContain("auth_bootstrap_parse");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("authorize POST redirects with exact original state", async () => {
     const clientId = await registerClient();
     const redirectUri = "http://127.0.0.1:3555/callback";

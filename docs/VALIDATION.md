@@ -13,8 +13,9 @@ The tests cover:
 
 - OAuth metadata, Dynamic Client Registration, redirect validation, state preservation, PKCE, token exchange, and stateless refresh tokens;
 - duplicate OAuth parameter rejection, resource validation, request-body limits, and invalid bearer-token challenges;
-- auth artifact parsing for Copy-as-cURL, raw Cookie headers, and `storage_state.json`;
+- auth artifact parsing for Copy-as-cURL (including `notebook.google.com`), raw Cookie headers, and `storage_state.json`;
 - safe artifact reporting without cookie-value leakage;
+- bootstrap redirect adoption from `notebooklm.google.com` to `notebook.google.com`;
 - MCP unauthenticated challenge and authenticated `tools/list`;
 - MCP input/output schema advertising and successful `structuredContent` for mocked tools, without raw upstream blobs in stable output schemas;
 - destructive tool confirmation requirements;
@@ -43,9 +44,9 @@ Before making a repository public, scan for accidental disclosures. At minimum, 
 - browser cookie names and raw cookie values;
 - OAuth/JWT-looking tokens;
 - Copy-as-cURL artifacts;
-- live Worker URLs and deployment IDs;
+- private Cloudflare account/deployment IDs, API tokens, and non-public Worker hostnames;
 - real notebook, source, artifact, or ChatGPT app IDs;
 - local machine paths and user names;
 - private support/debug transcripts.
 
-The public tree should contain only placeholder deployment URLs and synthetic test fixtures.
+Intended public `*.workers.dev` service URLs in `wrangler.jsonc` (OAuth issuer/resource/audience) are expected and not accidental disclosures. Keep secrets and private identifiers out of the tree; use synthetic fixtures in tests.

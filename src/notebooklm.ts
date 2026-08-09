@@ -64,7 +64,7 @@ const artifactTypeByCode: Record<number, string> = { 1: "audio", 2: "report", 3:
 const artifactTypeCodeByName: Record<string, number> = { audio: 1, report: 2, briefing_doc: 2, study_guide: 2, video: 3, quiz: 4, flashcards: 4, mind_map: 5, infographic: 7, slide_deck: 8, data_table: 9 };
 
 export class NotebookLMClient {
-  private readonly baseUrl: (typeof allowedNotebookLMBaseUrls)[number];
+  private baseUrl: (typeof allowedNotebookLMBaseUrls)[number];
   private readonly cookieHeader: string;
   private readonly fetchImpl: typeof fetch;
   private readonly copiedSessionId?: string;
@@ -412,11 +412,24 @@ export class NotebookLMClient {
       headers: { cookie: this.cookieHeader }
     });
     if (!response.ok) throw new NotebookLMError("NotebookLM authentication failed", "auth_bootstrap_http", { status: response.status });
+    this.adoptRedirectedBaseUrl(response.url);
     const html = await response.text();
     const csrfToken = extractWizField(html, "SNlM0e") ?? "";
     const sessionId = extractWizField(html, "FdrFJe") ?? "";
     if (!sessionId) throw new NotebookLMError("NotebookLM session bootstrap failed", "auth_bootstrap_parse");
     return { csrfToken, sessionId };
+  }
+
+  private adoptRedirectedBaseUrl(finalUrl: string | undefined): void {
+    if (!finalUrl) return;
+    let hostname: string;
+    try {
+      hostname = new URL(finalUrl).hostname;
+    } catch {
+      return;
+    }
+    const redirected = allowedNotebookLMBaseUrls.find((base) => new URL(base).hostname === hostname);
+    if (redirected) this.baseUrl = redirected;
   }
 }
 
