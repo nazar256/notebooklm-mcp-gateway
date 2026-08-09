@@ -27,10 +27,10 @@ curl -i http://localhost:8787/mcp
 
 ## Creating a local NotebookLM auth artifact
 
-1. Open NotebookLM in a browser where you are signed in.
+1. Open NotebookLM in a browser where you are signed in. Start at `https://notebooklm.google.com`; some accounts redirect to `https://notebook.google.com` (Gemini Notebook rebrand) — stay on whichever host the address bar shows.
 2. Open DevTools and the Network tab.
 3. Filter for `batchexecute`.
-4. Open or click a NotebookLM notebook until a `batchexecute` request appears.
+4. Open or click a NotebookLM notebook until a `batchexecute` request appears on that host.
 5. Right-click the request and choose **Copy → Copy as cURL**.
 6. Paste it only into the gateway's OAuth authorization form.
 
@@ -58,35 +58,52 @@ Example destructive guard shape:
 
 ## Deployment
 
-Before deploying, set exact Worker URLs in `wrangler.jsonc`:
+Production deploys run from GitHub Actions (`.github/workflows/deploy.yml`) on push to `main` or via **workflow_dispatch**. The workflow runs tests/typecheck, bootstraps the Worker if missing, initializes any missing Worker secrets, then runs `npx wrangler deploy`.
+
+### One-time GitHub setup
+
+1. Create a GitHub Environment named `production` on this repository.
+2. Add these environment secrets (same values as your other Cloudflare MCP gateways if scoped to the same account):
+   - `CLOUDFLARE_API_TOKEN` — Edit Cloudflare Workers token
+   - `CLOUDFLARE_ACCOUNT_ID` — Cloudflare account id
+
+### Worker URLs
+
+`wrangler.jsonc` must use the exact deployed host:
 
 ```text
-OAUTH_ISSUER=https://<your-worker-host>
-MCP_RESOURCE=https://<your-worker-host>/mcp
-MCP_AUDIENCE=https://<your-worker-host>/mcp
+OAUTH_ISSUER=https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev
+MCP_RESOURCE=https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev/mcp
+MCP_AUDIENCE=https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev/mcp
 ```
 
-Initialize secrets through stdin only:
+### Worker secrets
+
+On first deploy, Actions generates any missing secrets automatically:
+
+- `OAUTH_JWT_SIGNING_KEY_B64`
+- `NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64`
+- `CSRF_SIGNING_KEY_B64`
+
+Existing secrets are left unchanged. To set or rotate manually:
 
 ```bash
-openssl rand -base64 48 | wrangler secret put OAUTH_JWT_SIGNING_KEY_B64
+openssl rand -base64 32 | wrangler secret put OAUTH_JWT_SIGNING_KEY_B64
 openssl rand -base64 32 | wrangler secret put NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64
-openssl rand -base64 48 | wrangler secret put CSRF_SIGNING_KEY_B64
+openssl rand -base64 32 | wrangler secret put CSRF_SIGNING_KEY_B64
 ```
 
-Run checks and deploy:
+### Manual local deploy (optional)
 
 ```bash
 npm run check
 npx wrangler deploy
 ```
 
-If Wrangler requires a first deploy before secrets can be created, deploy once only with placeholder URLs and no real users, set secrets immediately, update `wrangler.jsonc` to the exact deployed Worker URL, then deploy again before connecting MCP clients.
-
 ## Troubleshooting
 
 - `invalid_artifact`: the pasted value was malformed or looked like Copy-as-URL instead of Copy-as-cURL.
-- NotebookLM credential rejection during OAuth: open NotebookLM in the same browser, confirm you are signed in, and copy a fresh `batchexecute` request.
+- NotebookLM credential rejection during OAuth: open NotebookLM in the same browser (including on `notebook.google.com` if redirected there), confirm you are signed in, and copy a fresh `batchexecute` request. The error page may include a failure stage such as `auth_bootstrap_parse` or `upstream_http`.
 - MCP tool error at `auth_bootstrap_http` or `auth_bootstrap_parse`: the stored browser session is stale or NotebookLM returned an unexpected sign-in/interstitial page.
 - MCP tool error at `upstream_http` or `upstream_parse`: the private NotebookLM RPC may have changed or the specific notebook/source/artifact ID may be invalid.
 - Old MCP profiles can hold expired access tokens. Re-run OAuth if refresh fails.

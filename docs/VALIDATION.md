@@ -13,8 +13,9 @@ The tests cover:
 
 - OAuth metadata, Dynamic Client Registration, redirect validation, state preservation, PKCE, token exchange, and stateless refresh tokens;
 - duplicate OAuth parameter rejection, resource validation, request-body limits, and invalid bearer-token challenges;
-- auth artifact parsing for Copy-as-cURL, raw Cookie headers, and `storage_state.json`;
+- auth artifact parsing for Copy-as-cURL (including `notebook.google.com`), raw Cookie headers, and `storage_state.json`;
 - safe artifact reporting without cookie-value leakage;
+- bootstrap redirect adoption from `notebooklm.google.com` to `notebook.google.com`;
 - MCP unauthenticated challenge and authenticated `tools/list`;
 - MCP input/output schema advertising and successful `structuredContent` for mocked tools, without raw upstream blobs in stable output schemas;
 - destructive tool confirmation requirements;

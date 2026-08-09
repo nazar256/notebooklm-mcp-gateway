@@ -23,6 +23,7 @@ See [SECURITY.md](SECURITY.md) before deploying or connecting real accounts.
 - Dynamic Client Registration at `POST /register`.
 - Short-lived MCP bearer access tokens and stateless refresh tokens bounded by the selected connector expiration.
 - Encrypted NotebookLM credential envelopes inside signed OAuth artifacts.
+- Supports consumer hosts `notebooklm.google.com` and `notebook.google.com` (Gemini Notebook redirect), plus `notebooklm.cloud.google.com`.
 - Server-enforced OAuth/MCP scopes so users can grant read-only or selected chat/write/delete/share capabilities at consent time.
 - Zod-backed MCP input/output schemas and `structuredContent` on successful tool calls.
 - Sanitized MCP tool errors and tool outputs that avoid exposing cookies, Authorization headers, JWTs, or raw upstream response bodies.
@@ -81,21 +82,16 @@ npm run typecheck
 
 ## Deployment overview
 
-1. Edit `wrangler.jsonc` so `OAUTH_ISSUER`, `MCP_RESOURCE`, and `MCP_AUDIENCE` match your deployed Worker URL exactly.
-2. Set secrets through Wrangler stdin only:
+Production deploys via GitHub Actions on push to `main` (or manual **workflow_dispatch**): test/typecheck, then Cloudflare Workers deploy. Configure a `production` GitHub Environment with `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. Missing Worker secrets are initialized on first deploy; existing secrets are not rotated.
 
-   ```bash
-   openssl rand -base64 48 | wrangler secret put OAUTH_JWT_SIGNING_KEY_B64
-   openssl rand -base64 32 | wrangler secret put NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64
-   openssl rand -base64 48 | wrangler secret put CSRF_SIGNING_KEY_B64
-   ```
+`wrangler.jsonc` already points `OAUTH_ISSUER` / `MCP_RESOURCE` / `MCP_AUDIENCE` at `https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev`. Keep those URLs exact after any host change.
 
-3. Run checks and deploy:
+Optional local deploy:
 
-   ```bash
-   npm run check
-   npx wrangler deploy
-   ```
+```bash
+npm run check
+npx wrangler deploy
+```
 
 Do not store real secrets, browser cookies, Copy-as-cURL artifacts, or MCP/OAuth tokens in `.env`, `.dev.vars`, docs, logs, or git.
 

@@ -29,6 +29,35 @@ describe("NotebookLMClient", () => {
     expect(new URLSearchParams(calls[1]?.body).get("at")).toBe("csrf-token");
   });
 
+  it("adopts notebook.google.com when bootstrap redirects from notebooklm.google.com", async () => {
+    const calls: Array<{ url: string; body?: string; origin?: string | null }> = [];
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input, init) => {
+        const url = String(input);
+        const body = typeof init?.body === "string" ? init.body : undefined;
+        const headers = new Headers(init?.headers);
+        calls.push({ url, body, origin: headers.get("origin") });
+        if (url === "https://notebooklm.google.com/" || url.endsWith("notebooklm.google.com/")) {
+          return {
+            ok: true,
+            status: 200,
+            url: "https://notebook.google.com/",
+            text: async () => bootstrapHtml
+          } as Response;
+        }
+        const rpc = decodeNotebookLMRpcRequest(body ?? "");
+        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]));
+      }
+    });
+
+    await expect(client.listNotebooks()).resolves.toEqual([{ id: "nb-1", title: "Notebook One" }]);
+    expect(calls[0]?.url).toBe("https://notebooklm.google.com/");
+    expect(calls[1]?.url.startsWith("https://notebook.google.com/_/LabsTailwindUi/data/batchexecute")).toBe(true);
+    expect(calls[1]?.origin).toBe("https://notebook.google.com");
+  });
+
   it("falls back to copied batchexecute bootstrap values when fresh bootstrap cannot be parsed", async () => {
     const calls: Array<{ url: string; body?: string }> = [];
     const client = new NotebookLMClient({

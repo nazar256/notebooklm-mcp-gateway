@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const allowedNotebookLMBaseUrls = [
   "https://notebooklm.google.com",
+  "https://notebook.google.com",
   "https://notebooklm.cloud.google.com"
 ] as const;
 
@@ -117,13 +118,17 @@ function makeEnvelope(
 }
 
 function detectBaseUrl(input: string): NotebookLMCredentialEnvelope["baseUrl"] {
-  return input.includes("notebooklm.cloud.google.com")
-    ? "https://notebooklm.cloud.google.com"
-    : "https://notebooklm.google.com";
+  if (input.includes("notebooklm.cloud.google.com")) {
+    return "https://notebooklm.cloud.google.com";
+  }
+  if (input.includes("notebook.google.com")) {
+    return "https://notebook.google.com";
+  }
+  return "https://notebooklm.google.com";
 }
 
 function looksLikeCopyAsUrl(input: string): boolean {
-  return /^https:\/\/notebooklm\.(?:google\.com|cloud\.google\.com)\//.test(input) && !hasCookieSignal(input);
+  return /^https:\/\/(?:notebooklm\.(?:google\.com|cloud\.google\.com)|notebook\.google\.com)\//.test(input) && !hasCookieSignal(input);
 }
 
 function hasCookieSignal(input: string): boolean {
@@ -203,7 +208,9 @@ function tryParseStorageState(input: string, now: Date): NotebookLMCredentialEnv
   const cookieHeader = relevantCookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
   const baseUrl = relevantCookies.some((cookie) => (cookie.domain ?? "").includes("cloud.google.com"))
     ? "https://notebooklm.cloud.google.com"
-    : "https://notebooklm.google.com";
+    : relevantCookies.some((cookie) => (cookie.domain ?? "").includes("notebook.google.com"))
+      ? "https://notebook.google.com"
+      : "https://notebooklm.google.com";
   return makeEnvelope(
     "notebooklm-py-storage-state",
     baseUrl,
