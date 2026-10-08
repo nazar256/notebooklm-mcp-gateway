@@ -46,6 +46,29 @@ describe("session store", () => {
     expect(raw).not.toContain("sid-test-value");
   });
 
+  it("token exchange seeds the session store for keep-alive coverage", async () => {
+    const kv = fakeKv();
+    const accessToken = await issueAccessToken("notebooklm:read", envWithKv(kv));
+    const claims = decodeJwt(accessToken) as { credential: Parameters<typeof decryptEnvelope>[0] };
+    const tokenEnvelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+    const stored = await loadSessionEnvelope(envWithKv(kv), tokenEnvelope.credId);
+    expect(stored?.cookieHeader).toContain("SID=sid-test-value");
+  });
+
+  it("persist unions with a concurrently written jar instead of overwriting it", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    // A faster call already persisted its newer rotation.
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=kv-newer`));
+    // A slower call seeded from the older snapshot rotates a different cookie.
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=stale; OTCSR=call-rotated`));
+    const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
+    expect(loaded?.cookieHeader).toContain("SIDCC=kv-newer");
+    expect(loaded?.cookieHeader).toContain("OTCSR=call-rotated");
+    expect(loaded?.cookieHeader).not.toContain("SIDCC=stale");
+  });
+
   it("returns null for unknown or missing credentials", async () => {
     const kv = fakeKv();
     const testEnv = envWithKv(kv);

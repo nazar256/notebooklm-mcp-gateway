@@ -1,6 +1,7 @@
 import type { NotebookLMCredentialEnvelope } from "./authArtifact";
+import { parseCookieHeader } from "./authArtifact";
 import type { Env } from "./config";
-import { decryptEnvelope, encryptedEnvelopeSchema, encryptEnvelope } from "./crypto";
+import { decryptEnvelope, encryptedEnvelopeSchema, encryptEnvelope, type EncryptedEnvelope } from "./crypto";
 import { NotebookLMClient } from "./notebooklm";
 
 // Per-connector session store in Workers KV. Values are the same AES-GCM
@@ -35,7 +36,30 @@ export async function persistSessionEnvelope(env: Env, envelope: NotebookLMCrede
   if (!kv || !envelope.credId) return;
   const cookieHeader = client.getCookieHeader();
   if (!cookieHeader) return;
-  const encrypted = await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+  // Merge instead of overwriting: a concurrent call may have persisted newer
+  // rotations after this call seeded its jar. The stored entry was written
+  // later, so it wins per-cookie conflicts; this call's unique cookies are
+  // still unioned in.
+  const stored = await loadSessionEnvelope(env, envelope.credId);
+  const mergedHeader = stored ? mergeCookieHeaders(cookieHeader, stored.cookieHeader) : cookieHeader;
+  const encrypted = await encryptEnvelope({ ...envelope, cookieHeader: mergedHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+  await kv.put(sessionKey(envelope.credId), JSON.stringify(encrypted), { expirationTtl: sessionTtlSeconds(env) });
+}
+
+// Union of two cookie headers: entries present only in `concurrent` are added,
+// and on per-name conflicts `concurrent` (the later write) wins.
+function mergeCookieHeaders(latest: string, concurrent: string): string {
+  const merged = parseCookieHeader(latest);
+  for (const [name, value] of parseCookieHeader(concurrent)) merged.set(name, value);
+  return [...merged.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
+}
+
+// Seeds the store for a freshly connected credential so the cron keep-alive
+// covers it even before the first tool call or refresh exchange.
+export async function seedSessionEnvelope(env: Env, envelope: NotebookLMCredentialEnvelope, encrypted: EncryptedEnvelope): Promise<void> {
+  const kv = sessionKv(env);
+  if (!kv || !envelope.credId) return;
+  if (await kv.get(sessionKey(envelope.credId))) return;
   await kv.put(sessionKey(envelope.credId), JSON.stringify(encrypted), { expirationTtl: sessionTtlSeconds(env) });
 }
 

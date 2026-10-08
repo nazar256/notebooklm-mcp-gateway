@@ -4,7 +4,7 @@ import { AuthArtifactError, parseCookieHeader, parseNotebookLMAuthArtifact } fro
 import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt, type EncryptedEnvelope } from "./crypto";
 import { parseUniqueUrlEncoded, readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
-import { loadSessionEnvelope, persistSessionEnvelope } from "./sessionStore";
+import { loadSessionEnvelope, persistSessionEnvelope, seedSessionEnvelope } from "./sessionStore";
 import { baselineScope, formatScopes, grantScopesFromConsent, notebookLmScopes, parseGrantedScopes, parseRequestedScopes, scopeLabels, type NotebookLMScope } from "./scopes";
 
 const REGISTER_MAX_BYTES = 64_000;
@@ -161,6 +161,13 @@ export async function token(request: Request, env: Env): Promise<Response> {
   const challenge = await pkceS256(parsed.code_verifier);
   if (challenge !== ("code_challenge" in code ? code.code_challenge : code.p)) throw new Error("invalid_grant");
   const credential = resolveAuthCodeCredential(code);
+  try {
+    // Seed the session store at connect time so the cron keep-alive covers
+    // this credential even before its first tool call or refresh exchange.
+    await seedSessionEnvelope(env, await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64), credential);
+  } catch {
+    // Seeding is best-effort; token issuance must not fail over KV.
+  }
   const ttlDays = "connector_ttl_days" in code ? code.connector_ttl_days : code.d;
   const scope = "scope" in code ? code.scope : code.s;
   const connectorExpiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString();
@@ -287,8 +294,11 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
   if (env.MOCK_NOTEBOOKLM_LIST_JSON) return credential;
   try {
     const envelope = await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+    // Seed the ping from the shared jar — it may be newer than the snapshot
+    // inside this refresh token, and persisting an older jar would regress it.
+    const stored = await loadSessionEnvelope(env, envelope.credId);
     const safeFetch: typeof fetch = (input, init) => fetch(input, init);
-    const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
+    const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: stored?.cookieHeader ?? envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
     const ping = await client.refreshCookies();
     const cookieHeader = client.getCookieHeader();
     console.log("NotebookLM credential refresh", {
