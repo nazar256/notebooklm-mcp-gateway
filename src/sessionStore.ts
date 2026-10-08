@@ -31,26 +31,34 @@ export async function loadSessionEnvelope(env: Env, credId: string | undefined):
   }
 }
 
-export async function persistSessionEnvelope(env: Env, envelope: NotebookLMCredentialEnvelope, client: NotebookLMClient): Promise<void> {
+export async function persistSessionEnvelope(env: Env, envelope: NotebookLMCredentialEnvelope, client: NotebookLMClient, seedHeader?: string): Promise<void> {
   const kv = sessionKv(env);
   if (!kv || !envelope.credId) return;
   const cookieHeader = client.getCookieHeader();
   if (!cookieHeader) return;
-  // Merge instead of overwriting: a concurrent call may have persisted newer
-  // rotations after this call seeded its jar. The stored entry was written
-  // later, so it wins per-cookie conflicts; this call's unique cookies are
-  // still unioned in.
+  // Three-way merge: cookies this call rotated relative to its seed win;
+  // untouched names keep whatever the store has (a concurrent call's newer
+  // rotation); deletions the call observed remove stored entries.
   const stored = await loadSessionEnvelope(env, envelope.credId);
-  const mergedHeader = stored ? mergeCookieHeaders(cookieHeader, stored.cookieHeader) : cookieHeader;
+  const mergedHeader = stored ? mergeCookieHeaders(cookieHeader, seedHeader ?? envelope.cookieHeader, stored.cookieHeader) : cookieHeader;
   const encrypted = await encryptEnvelope({ ...envelope, cookieHeader: mergedHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
   await kv.put(sessionKey(envelope.credId), JSON.stringify(encrypted), { expirationTtl: sessionTtlSeconds(env) });
 }
 
-// Union of two cookie headers: entries present only in `concurrent` are added,
-// and on per-name conflicts `concurrent` (the later write) wins.
-function mergeCookieHeaders(latest: string, concurrent: string): string {
-  const merged = parseCookieHeader(latest);
-  for (const [name, value] of parseCookieHeader(concurrent)) merged.set(name, value);
+function mergeCookieHeaders(latest: string, seed: string, stored: string): string {
+  const latestCookies = parseCookieHeader(latest);
+  const seedCookies = parseCookieHeader(seed);
+  const storedCookies = parseCookieHeader(stored);
+  const merged = new Map(storedCookies);
+  for (const [name, value] of latestCookies) {
+    // The call rotated this cookie during the request — its value is newest.
+    if (seedCookies.get(name) !== value || !storedCookies.has(name)) merged.set(name, value);
+  }
+  for (const name of seedCookies.keys()) {
+    // The call deleted this cookie (e.g. expired Set-Cookie) — drop it even
+    // when a concurrent writer still has it.
+    if (!latestCookies.has(name)) merged.delete(name);
+  }
   return [...merged.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
 }
 
@@ -109,7 +117,7 @@ async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise
     });
     const ping = await client.refreshCookies();
     if (ping === "alive") {
-      await persistSessionEnvelope(env, stored, client);
+      await persistSessionEnvelope(env, stored, client, stored.cookieHeader);
       return "kept";
     }
     if (ping === "expired") {

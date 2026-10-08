@@ -55,18 +55,40 @@ describe("session store", () => {
     expect(stored?.cookieHeader).toContain("SID=sid-test-value");
   });
 
+  it("persist lets a call's own rotations win over the stored jar", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=seeded`));
+    // The call seeded with SIDCC=seeded and rotated it mid-request.
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=call-rotated`), `${sampleCookie}; SIDCC=seeded`);
+    const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
+    expect(loaded?.cookieHeader).toContain("SIDCC=call-rotated");
+  });
+
   it("persist unions with a concurrently written jar instead of overwriting it", async () => {
     const kv = fakeKv();
     const testEnv = envWithKv(kv);
     const envelope = parseEnvelope();
     // A faster call already persisted its newer rotation.
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=kv-newer`));
-    // A slower call seeded from the older snapshot rotates a different cookie.
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=stale; OTCSR=call-rotated`));
+    const kvHeader = `${sampleCookie}; SIDCC=kv-newer`;
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, kvHeader));
+    // A slower call seeded from that same jar did not touch SIDCC but rotated OTCSR.
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=kv-newer; OTCSR=call-rotated`), kvHeader);
     const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
     expect(loaded?.cookieHeader).toContain("SIDCC=kv-newer");
     expect(loaded?.cookieHeader).toContain("OTCSR=call-rotated");
-    expect(loaded?.cookieHeader).not.toContain("SIDCC=stale");
+  });
+
+  it("persist applies deletions the call observed to the stored jar", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=seeded`));
+    // The call deleted SIDCC mid-request (e.g. an expired Set-Cookie).
+    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, sampleCookie), `${sampleCookie}; SIDCC=seeded`);
+    const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
+    expect(loaded?.cookieHeader).not.toContain("SIDCC");
   });
 
   it("returns null for unknown or missing credentials", async () => {

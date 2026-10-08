@@ -298,7 +298,8 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     // inside this refresh token, and persisting an older jar would regress it.
     const stored = await loadSessionEnvelope(env, envelope.credId);
     const safeFetch: typeof fetch = (input, init) => fetch(input, init);
-    const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: stored?.cookieHeader ?? envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
+    const seedHeader = stored?.cookieHeader ?? envelope.cookieHeader;
+    const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: seedHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
     const ping = await client.refreshCookies();
     const cookieHeader = client.getCookieHeader();
     console.log("NotebookLM credential refresh", {
@@ -309,7 +310,7 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     if (ping === "alive") {
       // Persist the rotated jar into the shared session store so subsequent
       // calls pick it up without waiting for the next token exchange.
-      await persistSessionEnvelope(env, envelope, client);
+      await persistSessionEnvelope(env, envelope, client, seedHeader);
     }
     if (!cookieHeader || cookieHeader === envelope.cookieHeader) return credential;
     return await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
