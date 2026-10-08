@@ -835,8 +835,8 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
 // A Set-Cookie can delete a cookie with a nonempty value via Max-Age<=0 or a past
 // Expires date; both must remove the jar entry regardless of the value carried.
 function isExpiredSetCookie(attributes: string[]): boolean {
-  // RFC 6265: a present Max-Age takes precedence over Expires, so a positive
-  // Max-Age keeps the cookie alive even when Expires is in the past.
+  // RFC 6265: a present *valid* Max-Age takes precedence over Expires. An invalid
+  // Max-Age is ignored by browsers, so Expires still decides in that case.
   let maxAgeSeen = false;
   let expiresAt = Number.NaN;
   for (const attribute of attributes) {
@@ -844,6 +844,7 @@ function isExpiredSetCookie(attributes: string[]): boolean {
     const name = key.trim().toLowerCase();
     const value = rawValue.trim();
     if (name === "max-age") {
+      if (!/^-?\d+$/.test(value)) continue;
       maxAgeSeen = true;
       if (Number(value) <= 0) return true;
     } else if (name === "expires") {

@@ -477,6 +477,24 @@ describe("NotebookLMClient", () => {
     expect(client.getCookieHeader()).toContain("SIDCC=still-valid");
   });
 
+  it("lets Expires decide when Max-Age is not a valid integer", async () => {
+    const bootstrapHeaders = new Headers();
+    bootstrapHeaders.append("set-cookie", "SIDCC=dead-invalid-age; Max-Age=invalid; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml, { headers: bootstrapHeaders });
+        const rpc = decodeNotebookLMRpcRequest(typeof init?.body === "string" ? init.body : "");
+        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]));
+      }
+    });
+
+    await client.listNotebooks();
+    expect(client.getCookieHeader()).not.toContain("SIDCC");
+  });
+
   it("refreshCookies keeps the original jar when the session is expired instead of foreign sign-in cookies", async () => {
     const loginHeaders = new Headers();
     loginHeaders.append("set-cookie", "SIDCC=foreign-account-sidcc; Path=/");
