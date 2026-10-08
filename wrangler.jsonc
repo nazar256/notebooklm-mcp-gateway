@@ -3,6 +3,10 @@
   "name": "notebooklm-mcp-gateway",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-03",
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true }
+  },
   "vars": {
     "OAUTH_ISSUER": "https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev",
     "MCP_RESOURCE": "https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev/mcp",

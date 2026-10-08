@@ -77,6 +77,8 @@ export const refreshTokenClaimsSchema = z.object({
   credential: encryptedEnvelopeSchema
 });
 
+export type EncryptedEnvelope = z.infer<typeof encryptedEnvelopeSchema>;
+
 export type AuthCodeClaims = z.infer<typeof authCodeClaimsSchema>;
 export type AccessTokenClaims = z.infer<typeof accessTokenClaimsSchema>;
 export type RefreshTokenClaims = z.infer<typeof refreshTokenClaimsSchema>;

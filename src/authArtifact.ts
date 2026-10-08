@@ -269,7 +269,7 @@ function normalizeCookieHeader(cookieHeader: string): string {
   return compactCookieHeader(normalized);
 }
 
-const notebookLmCookieAllowlist = new Set([
+export const notebookLmCookieAllowlist = new Set([
   "SID",
   "__Secure-1PSID",
   "__Secure-3PSID",
@@ -286,8 +286,21 @@ const notebookLmCookieAllowlist = new Set([
   "__Secure-1PSIDCC",
   "__Secure-3PSIDCC",
   "__Secure-1PSIDTS",
-  "__Secure-3PSIDTS"
+  "__Secure-3PSIDTS",
+  "__Secure-1PSIDRTS",
+  "__Secure-3PSIDRTS"
 ]);
+
+export function parseCookieHeader(cookieHeader: string): Map<string, string> {
+  const cookies = new Map<string, string>();
+  for (const part of cookieHeader.split(";")) {
+    const trimmed = part.trim();
+    const separator = trimmed.indexOf("=");
+    if (separator <= 0) continue;
+    cookies.set(trimmed.slice(0, separator).trim(), trimmed.slice(separator + 1).trim());
+  }
+  return cookies;
+}
 
 function compactCookieHeader(cookieHeader: string): string {
   const cookies = new Map<string, string>();

@@ -1,6 +1,6 @@
 import { decodeJwt, SignJWT } from "jose";
-import { describe, expect, it } from "vitest";
-import { base64ToBytes, encryptEnvelope, pkceS256, signJwt } from "../src/crypto";
+import { describe, expect, it, vi } from "vitest";
+import { base64ToBytes, decryptEnvelope, encryptEnvelope, pkceS256, signJwt } from "../src/crypto";
 import { env, fetchWorker, registerClient, sampleCookie } from "./helpers";
 
 async function authorizeAndExchange(scope: string, selectedScopes = scope) {
@@ -287,6 +287,48 @@ describe("OAuth", () => {
     expect(refreshedBody.expires_in).toBe(3600);
     expect(decodeJwt(String(refreshedBody.access_token))).toMatchObject({ typ: "access-token", aud: env.MCP_AUDIENCE });
     expect(decodeJwt(String(refreshedBody.refresh_token))).toMatchObject({ typ: "refresh-token", aud: env.OAUTH_ISSUER });
+  });
+
+  it("refresh exchange bakes rotated upstream cookies into the credential envelope", async () => {
+    const { clientId, tokenBody } = await authorizeAndExchange("notebooklm:read");
+    const noMockEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("MOCK_")));
+    const bootstrapHtml = `<!doctype html><script>{"SNlM0e":"csrf","FdrFJe":"sid"}</script>`;
+    vi.stubGlobal("fetch", async () => {
+      const headers = new Headers();
+      headers.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly");
+      headers.append("set-cookie", "SIDCC=rotated-sidcc; Path=/");
+      headers.append("set-cookie", "unrelated_tracker=x; Path=/");
+      return new Response(bootstrapHtml, { headers });
+    });
+    try {
+      const refreshed = await fetchWorker("/token", { method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokenBody.refresh_token, client_id: clientId }) }, noMockEnv);
+      expect(refreshed.status).toBe(200);
+      const refreshedBody = await refreshed.json() as { refresh_token: string };
+      const claims = decodeJwt(refreshedBody.refresh_token) as { credential: Parameters<typeof decryptEnvelope>[0] };
+      const envelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+      expect(envelope.cookieHeader).toContain("__Secure-1PSIDTS=rotated-ts");
+      expect(envelope.cookieHeader).toContain("SIDCC=rotated-sidcc");
+      expect(envelope.cookieHeader).toContain("SID=sid-test-value");
+      expect(envelope.cookieHeader).not.toContain("unrelated_tracker");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("refresh exchange keeps the previous envelope when upstream is unreachable", async () => {
+    const { clientId, tokenBody } = await authorizeAndExchange("notebooklm:read");
+    const noMockEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("MOCK_")));
+    vi.stubGlobal("fetch", async () => { throw new Error("network down"); });
+    try {
+      const refreshed = await fetchWorker("/token", { method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokenBody.refresh_token, client_id: clientId }) }, noMockEnv);
+      expect(refreshed.status).toBe(200);
+      const refreshedBody = await refreshed.json() as { refresh_token: string };
+      const claims = decodeJwt(refreshedBody.refresh_token) as { credential: Parameters<typeof decryptEnvelope>[0] };
+      const envelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+      expect(envelope.cookieHeader).toContain("SID=sid-test-value");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("token exchange returns selected scope and embeds it in access and refresh JWTs", async () => {

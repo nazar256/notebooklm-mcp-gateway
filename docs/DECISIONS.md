@@ -53,3 +53,12 @@ NotebookLM responses can contain private notebook/source/user data beyond the no
 ## ADR-010: Use a coarse OAuth grant for the first public release
 
 The first public release does not implement per-tool OAuth scopes. Authorization grants access to the full MCP tool surface exposed by the Worker for the pasted NotebookLM browser session. Destructive and permission-changing actions remain guarded by explicit confirmation inputs. If future users need least-privilege consent, add a scoped grant model before widening deployment beyond self-hosted/experimental use.
+
+## ADR-011: Rotate NotebookLM cookies through the refresh-token envelope
+
+Google rotates NotebookLM session cookies (`SIDCC`, `__Secure-*PSIDCC`, `__Secure-*PSIDTS` families) via `Set-Cookie` on upstream responses; a pasted Copy-as-cURL snapshot goes stale within days while the browser session keeps working. To stay within the stateless design (ADR-001), rotated cookies are persisted inside the encrypted credential envelope rather than server-side storage:
+
+- `NotebookLMClient` keeps a per-invocation cookie jar: every upstream response's allowlisted `Set-Cookie` updates are merged and sent on subsequent upstream calls. Expired `Set-Cookie` values (`Max-Age<=0`, past `Expires`) delete jar entries, and sign-in responses never contribute cookies — a dead session cannot leak another account's cookies into the jar.
+- On every refresh-token exchange the Worker pings NotebookLM (bootstrap plus a read-only RPC, so batchexecute-level rotations are captured too) and bakes the merged cookie header into the re-encrypted envelope carried by the new access and refresh tokens. Failures reuse the previous envelope so token rotation never breaks.
+
+Sessions can still expire when no refresh happens inside Google's grace window, or when Google invalidates the underlying session. Those cases surface as distinct failure stages (`auth_expired` for sign-in redirects/HTML/401/403, `upstream_null` for required RPC frames with null payloads) instead of a generic `upstream_parse`.

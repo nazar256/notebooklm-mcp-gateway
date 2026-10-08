@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { Env } from "./config";
 import { AuthArtifactError, parseNotebookLMAuthArtifact } from "./authArtifact";
-import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt } from "./crypto";
+import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt, type EncryptedEnvelope } from "./crypto";
 import { parseUniqueUrlEncoded, readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
 import { baselineScope, formatScopes, grantScopesFromConsent, notebookLmScopes, parseGrantedScopes, parseRequestedScopes, scopeLabels, type NotebookLMScope } from "./scopes";
@@ -143,7 +143,8 @@ export async function token(request: Request, env: Env): Promise<Response> {
     if (claims.client_id !== parsed.client_id) throw new Error("invalid_grant");
     const ttlSeconds = secondsUntil(claims.connector_expires_at);
     if (ttlSeconds <= 0) throw new Error("invalid_grant");
-    const tokenPayload = { typ: "access-token", client_id: claims.client_id, scope: claims.scope, connector_expires_at: claims.connector_expires_at, credential: claims.credential };
+    const credential = await refreshCredentialCookies(claims.credential, env);
+    const tokenPayload = { typ: "access-token", client_id: claims.client_id, scope: claims.scope, connector_expires_at: claims.connector_expires_at, credential };
     const accessToken = await signJwt(tokenPayload, env.OAUTH_JWT_SIGNING_KEY_B64, env.OAUTH_ISSUER, env.MCP_AUDIENCE, env.ACCESS_TOKEN_TTL_SECONDS);
     const refreshToken = await signJwt({ ...tokenPayload, typ: "refresh-token" }, env.OAUTH_JWT_SIGNING_KEY_B64, env.OAUTH_ISSUER, env.OAUTH_ISSUER, ttlSeconds);
     return json({ access_token: accessToken, token_type: "Bearer", expires_in: env.ACCESS_TOKEN_TTL_SECONDS, refresh_token: refreshToken, scope: claims.scope });
@@ -270,6 +271,26 @@ function secondsUntil(isoDate: string): number {
   const expiresAt = Date.parse(isoDate);
   if (Number.isNaN(expiresAt)) return 0;
   return Math.ceil((expiresAt - Date.now()) / 1000);
+}
+
+// Google rotates NotebookLM session cookies via Set-Cookie on upstream responses,
+// so the pasted snapshot goes stale within days. Each refresh-token exchange is a
+// chance to ping NotebookLM, harvest the rotated cookies, and bake them into the
+// re-encrypted credential envelope carried by the new tokens. Best effort only: on
+// any failure the previous envelope is reused so token rotation never breaks.
+async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env): Promise<EncryptedEnvelope> {
+  if (env.MOCK_NOTEBOOKLM_LIST_JSON) return credential;
+  try {
+    const envelope = await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+    const safeFetch: typeof fetch = (input, init) => fetch(input, init);
+    const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
+    await client.refreshCookies();
+    const cookieHeader = client.getCookieHeader();
+    if (!cookieHeader || cookieHeader === envelope.cookieHeader) return credential;
+    return await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+  } catch {
+    return credential;
+  }
 }
 
 async function validateNotebookLMCredentials(envelope: ReturnType<typeof parseNotebookLMAuthArtifact>, env: Env): Promise<string | null> {

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { allowedNotebookLMBaseUrls } from "./authArtifact";
+import { allowedNotebookLMBaseUrls, notebookLmCookieAllowlist, parseCookieHeader } from "./authArtifact";
 
 export type NotebookSummary = { id: string; title: string };
 export type Notebook = NotebookSummary & { sourcesCount: number; createdAt: string | null; isOwner: boolean };
@@ -11,7 +11,7 @@ export type Artifact = { id: string; title: string; type: string; status: string
 export type GenerationStatus = { taskId: string; status: string; artifactId: string | null };
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
-export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "upstream_http" | "upstream_parse";
+export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
@@ -63,6 +63,9 @@ const artifactStatusByCode: Record<number, string> = { 1: "in_progress", 2: "pen
 const artifactTypeByCode: Record<number, string> = { 1: "audio", 2: "report", 3: "video", 4: "quiz", 5: "mind_map", 7: "infographic", 8: "slide_deck", 9: "data_table" };
 const artifactTypeCodeByName: Record<string, number> = { audio: 1, report: 2, briefing_doc: 2, study_guide: 2, video: 3, quiz: 4, flashcards: 4, mind_map: 5, infographic: 7, slide_deck: 8, data_table: 9 };
 
+// Last-resort boq build label; the live value is read from the bootstrap HTML (cfb2h).
+const fallbackBuildLabel = "boq_labs-tailwind-frontend_20260108.06_p0";
+
 export class NotebookLMClient {
   private baseUrl: (typeof allowedNotebookLMBaseUrls)[number];
   private readonly cookieHeader: string;
@@ -71,6 +74,7 @@ export class NotebookLMClient {
   private readonly copiedCsrfToken?: string;
   private readonly validationRpcId?: string;
   private readonly validationFReq?: string;
+  private readonly cookieJar: Map<string, string>;
 
   constructor(options: { baseUrl: string; cookieHeader: string; fetch: typeof fetch; sessionId?: string; csrfToken?: string; validationRpcId?: string; validationFReq?: string }) {
     const baseUrl = z.enum(allowedNotebookLMBaseUrls).parse(options.baseUrl);
@@ -81,6 +85,34 @@ export class NotebookLMClient {
     this.copiedCsrfToken = options.csrfToken;
     this.validationRpcId = options.validationRpcId;
     this.validationFReq = options.validationFReq;
+    this.cookieJar = parseCookieHeader(options.cookieHeader);
+  }
+
+  // Google rotates session cookies (SIDCC/PSIDCC/PSIDTS families) via Set-Cookie on
+  // nearly every response. Tracking them here keeps the pasted snapshot fresher for
+  // the life of this invocation, and lets callers persist the rotated values. The jar
+  // starts from the pasted header, so non-allowlisted pasted cookies keep being sent;
+  // an emptied jar stays empty rather than resurrecting deleted cookies.
+  getCookieHeader(): string {
+    return [...this.cookieJar.entries()]
+      .map(([name, value]) => `${name}=${value}`)
+      .join("; ");
+  }
+
+  // Best-effort upstream session ping whose only purpose is collecting Set-Cookie
+  // rotation. Runs a real authenticated RPC, not just the shell, so batchexecute-level
+  // rotations are captured too. Errors are swallowed; on auth_expired the jar is
+  // restored so a dead session cannot persist cookies from a sign-in response.
+  async refreshCookies(): Promise<void> {
+    const seeded = new Map(this.cookieJar);
+    try {
+      await this.validateAuthentication();
+    } catch (error) {
+      if (error instanceof NotebookLMError && error.stage === "auth_expired") {
+        this.cookieJar.clear();
+        for (const [name, value] of seeded) this.cookieJar.set(name, value);
+      }
+    }
   }
 
   async validateAuthentication(): Promise<void> {
@@ -246,12 +278,12 @@ export class NotebookLMClient {
     body.set("f.req", JSON.stringify([null, JSON.stringify(params)]));
     if (bootstrap.csrfToken) body.set("at", bootstrap.csrfToken);
     const url = new URL(`${this.baseUrl}/_/LabsTailwindUi/data/google.internal.labs.tailwind.orchestration.v1.LabsTailwindOrchestrationService/GenerateFreeFormStreamed`);
-    url.searchParams.set("bl", "boq_labs-tailwind-frontend_20260108.06_p0");
+    url.searchParams.set("bl", bootstrap.buildLabel ?? fallbackBuildLabel);
     url.searchParams.set("f.sid", bootstrap.sessionId);
     url.searchParams.set("hl", "en");
     url.searchParams.set("_reqid", String(Date.now() % 100000));
     url.searchParams.set("rt", "c");
-    const response = await this.fetchImpl(url.toString(), { method: "POST", headers: this.rpcHeaders(), body: `${body.toString()}&` });
+    const response = await this.upstreamFetch(url.toString(), { method: "POST", headers: this.rpcHeaders(), body: `${body.toString()}&` });
     if (!response.ok) throw new Error("NotebookLM chat request failed");
     const parsedChat = parseChatResponse(await response.text());
     return { answer: parsedChat.answer, conversationId, references: parsedChat.references };
@@ -381,43 +413,84 @@ export class NotebookLMClient {
     body.set("f.req", options.fReq ?? JSON.stringify(rpcRequest));
     if (bootstrap.csrfToken) body.set("at", bootstrap.csrfToken);
 
-    const response = await this.fetchImpl(url.toString(), {
+    const response = await this.upstreamFetch(url.toString(), {
       method: "POST",
       headers: this.rpcHeaders(),
       body: body.toString()
     });
-    if (!response.ok) throw new NotebookLMError("NotebookLM request failed", "upstream_http", { status: response.status });
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        throw new NotebookLMError("NotebookLM rejected the session", "auth_expired", { status: response.status });
+      }
+      throw new NotebookLMError("NotebookLM request failed", "upstream_http", { status: response.status });
+    }
+    if (isLoginUrl(response.url) || isHtmlResponse(response)) {
+      throw new NotebookLMError("NotebookLM redirected to sign-in", "auth_expired");
+    }
     try {
       return extractRpcResult(parseNotebookLMResponse(await response.text()), rpcId, options);
     } catch (error) {
+      if (error instanceof NotebookLMError) throw error;
       throw new NotebookLMError("NotebookLM response parse failed", "upstream_parse", { cause: error });
     }
   }
 
   private rpcHeaders(): HeadersInit {
-    return { "content-type": "application/x-www-form-urlencoded;charset=UTF-8", "cookie": this.cookieHeader, "origin": this.baseUrl, "referer": `${this.baseUrl}/`, "x-same-domain": "1" };
+    return { "content-type": "application/x-www-form-urlencoded;charset=UTF-8", "cookie": this.getCookieHeader(), "origin": this.baseUrl, "referer": `${this.baseUrl}/`, "x-same-domain": "1" };
   }
 
-  private async bootstrap(): Promise<{ csrfToken: string; sessionId: string }> {
+  private async upstreamFetch(input: string | URL, init?: RequestInit): Promise<Response> {
+    const response = await this.fetchImpl(input, init);
+    // Sign-in pages may set allowlisted cookies for accounts.google.com — those belong
+    // to a different account context and must never enter the jar.
+    if (!isLoginUrl(response.url)) this.captureSetCookies(response.headers);
+    return response;
+  }
+
+  private captureSetCookies(headers: Headers | undefined): void {
+    const setCookies = headers?.getSetCookie?.() ?? [];
+    for (const raw of setCookies) {
+      const [pair, ...attributes] = raw.split(";");
+      const separator = pair.indexOf("=");
+      if (separator <= 0) continue;
+      const name = pair.slice(0, separator).trim();
+      const value = pair.slice(separator + 1).trim();
+      if (!notebookLmCookieAllowlist.has(name)) continue;
+      if (value && !isExpiredSetCookie(attributes)) this.cookieJar.set(name, value);
+      else this.cookieJar.delete(name);
+    }
+  }
+
+  private async bootstrap(): Promise<{ csrfToken: string; sessionId: string; buildLabel?: string }> {
     try {
       return await this.fetchFreshBootstrap();
     } catch (error) {
+      if (error instanceof NotebookLMError && error.stage === "auth_expired") throw error;
       if (this.copiedSessionId) return { csrfToken: this.copiedCsrfToken ?? "", sessionId: this.copiedSessionId };
       throw error;
     }
   }
 
-  private async fetchFreshBootstrap(): Promise<{ csrfToken: string; sessionId: string }> {
-    const response = await this.fetchImpl(`${this.baseUrl}/`, {
-      headers: { cookie: this.cookieHeader }
+  private async fetchFreshBootstrap(): Promise<{ csrfToken: string; sessionId: string; buildLabel?: string }> {
+    const response = await this.upstreamFetch(`${this.baseUrl}/`, {
+      headers: { cookie: this.getCookieHeader() }
     });
-    if (!response.ok) throw new NotebookLMError("NotebookLM authentication failed", "auth_bootstrap_http", { status: response.status });
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        throw new NotebookLMError("NotebookLM rejected the session", "auth_expired", { status: response.status });
+      }
+      throw new NotebookLMError("NotebookLM authentication failed", "auth_bootstrap_http", { status: response.status });
+    }
     this.adoptRedirectedBaseUrl(response.url);
     const html = await response.text();
+    if (isLoginUrl(response.url) || looksLikeGoogleLogin(html)) {
+      throw new NotebookLMError("NotebookLM session expired", "auth_expired");
+    }
     const csrfToken = extractWizField(html, "SNlM0e") ?? "";
     const sessionId = extractWizField(html, "FdrFJe") ?? "";
     if (!sessionId) throw new NotebookLMError("NotebookLM session bootstrap failed", "auth_bootstrap_parse");
-    return { csrfToken, sessionId };
+    const buildLabel = extractWizField(html, "cfb2h") ?? undefined;
+    return { csrfToken, sessionId, buildLabel };
   }
 
   private adoptRedirectedBaseUrl(finalUrl: string | undefined): void {
@@ -736,17 +809,68 @@ export function parseNotebookLMResponse(responseText: string): unknown[] {
 
 function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull?: boolean } = {}): unknown {
   let result: unknown;
+  let sawNullPayload = false;
   for (const chunk of chunks) {
     if (!Array.isArray(chunk)) continue;
     const items = Array.isArray(chunk[0]) ? chunk : [chunk];
     for (const item of items) {
       if (!Array.isArray(item) || item[0] !== "wrb.fr" || item[1] !== rpcId) continue;
-      if (item[2] === null && options.allowNull && result === undefined) result = null;
+      if (item[2] === null) {
+        if (options.allowNull && result === undefined) result = null;
+        else sawNullPayload = true;
+        continue;
+      }
       if (typeof item[2] === "string" && item[2]) result = JSON.parse(item[2]);
     }
   }
-  if (result === undefined) throw new Error("NotebookLM response did not include expected RPC result");
+  if (result === undefined) {
+    // A well-formed response whose RPC frame carries a null payload is batchexecute's
+    // typical answer for a rejected/stale session or CSRF token.
+    if (sawNullPayload) throw new NotebookLMError("NotebookLM returned an empty result", "upstream_null");
+    throw new Error("NotebookLM response did not include expected RPC result");
+  }
   return result;
+}
+
+// A Set-Cookie can delete a cookie with a nonempty value via Max-Age<=0 or a past
+// Expires date; both must remove the jar entry regardless of the value carried.
+function isExpiredSetCookie(attributes: string[]): boolean {
+  // RFC 6265: a present *valid* Max-Age takes precedence over Expires. An invalid
+  // Max-Age is ignored by browsers, so Expires still decides in that case.
+  let maxAgeSeen = false;
+  let expiresAt = Number.NaN;
+  for (const attribute of attributes) {
+    const [key, rawValue = ""] = attribute.split("=", 2);
+    const name = key.trim().toLowerCase();
+    const value = rawValue.trim();
+    if (name === "max-age") {
+      if (!/^-?\d+$/.test(value)) continue;
+      maxAgeSeen = true;
+      if (Number(value) <= 0) return true;
+    } else if (name === "expires") {
+      expiresAt = Date.parse(value);
+    }
+  }
+  if (maxAgeSeen) return false;
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function isLoginUrl(responseUrl: string | undefined): boolean {
+  if (!responseUrl) return false;
+  try {
+    const url = new URL(responseUrl);
+    return url.hostname === "accounts.google.com" || /\/signin|\/ServiceLogin|\/InteractiveLogin/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isHtmlResponse(response: Response): boolean {
+  return (response.headers?.get?.("content-type") ?? "").includes("text/html");
+}
+
+function looksLikeGoogleLogin(html: string): boolean {
+  return html.includes("accounts.google.com/ServiceLogin") || html.includes("/signin/v2") || html.includes("/v3/signin");
 }
 
 function extractWizField(html: string, key: string): string | null {
