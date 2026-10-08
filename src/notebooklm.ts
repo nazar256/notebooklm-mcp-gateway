@@ -101,17 +101,18 @@ export class NotebookLMClient {
 
   // Best-effort upstream session ping whose only purpose is collecting Set-Cookie
   // rotation. Runs a real authenticated RPC, not just the shell, so batchexecute-level
-  // rotations are captured too. Errors are swallowed; on auth_expired the jar is
-  // restored so a dead session cannot persist cookies from a sign-in response.
-  async refreshCookies(): Promise<void> {
+  // rotations are captured too. The jar is persisted only on a fully successful ping:
+  // on any failure it is restored to the seed, so cookies captured during a rejected
+  // or half-dead exchange can never poison refreshed tokens.
+  async refreshCookies(): Promise<"alive" | "expired" | "failed"> {
     const seeded = new Map(this.cookieJar);
     try {
       await this.validateAuthentication();
+      return "alive";
     } catch (error) {
-      if (error instanceof NotebookLMError && error.stage === "auth_expired") {
-        this.cookieJar.clear();
-        for (const [name, value] of seeded) this.cookieJar.set(name, value);
-      }
+      this.cookieJar.clear();
+      for (const [name, value] of seeded) this.cookieJar.set(name, value);
+      return error instanceof NotebookLMError && error.stage === "auth_expired" ? "expired" : "failed";
     }
   }
 

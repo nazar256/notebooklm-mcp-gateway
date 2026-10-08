@@ -7,6 +7,14 @@
     "enabled": true,
     "logs": { "enabled": true }
   },
+  "kv_namespaces": [
+    { "binding": "NOTEBOOKLM_SESSION_KV", "id": "__NOTEBOOKLM_SESSION_KV_ID__" }
+  ],
+  "triggers": {
+    // Keep-alive ping every 3 hours so Google cookie rotations accumulate in
+    // the KV session jar even while MCP clients are idle.
+    "crons": ["15 */3 * * *"]
+  },
   "vars": {
     "OAUTH_ISSUER": "https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev",
     "MCP_RESOURCE": "https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev/mcp",

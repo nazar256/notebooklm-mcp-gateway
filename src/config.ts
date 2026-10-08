@@ -10,6 +10,9 @@ export const envSchema = z.object({
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400),
   AUTH_CODE_TTL_SECONDS: z.coerce.number().int().min(60).max(900),
   CONNECTOR_TTL_MAX_DAYS: z.coerce.number().int().min(1).max(3650),
+  // Workers KV binding holding encrypted per-connector session envelopes.
+  // Absent in tests/local dev — the worker then runs fully stateless.
+  NOTEBOOKLM_SESSION_KV: z.custom<KVNamespace | undefined>((v) => v === undefined || (v !== null && typeof v === "object")).optional(),
   OAUTH_EXTRA_REDIRECT_URI_PATTERNS: z.string().optional(),
   MOCK_NOTEBOOKLM_LIST_JSON: z.string().optional(),
   MOCK_NOTEBOOKLM_RENAME_JSON: z.string().optional(),

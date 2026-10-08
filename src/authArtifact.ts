@@ -16,6 +16,9 @@ export const notebookLMCredentialEnvelopeSchema = z.object({
   validationRpcId: z.string().min(1).optional(),
   validationFReq: z.string().min(1).optional(),
   accountEmail: z.string().email().optional(),
+  // Stable per-connector identity used to key the shared session jar in KV.
+  // Absent on envelopes minted before the KV store existed.
+  credId: z.string().min(1).optional(),
   createdAt: z.string().datetime()
 });
 
@@ -113,6 +116,7 @@ function makeEnvelope(
     validationRpcId: bootstrap?.validationRpcId,
     validationFReq: bootstrap?.validationFReq,
     accountEmail,
+    credId: crypto.randomUUID(),
     createdAt: now.toISOString()
   });
 }

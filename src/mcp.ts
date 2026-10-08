@@ -5,6 +5,7 @@ import type { Env } from "./config";
 import type { NotebookLMCredentialEnvelope } from "./authArtifact";
 import { readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
+import { deleteSession, persistSessionEnvelope } from "./sessionStore";
 import { hasRequiredScopes, requiredScopesForTool, type NotebookLMScope } from "./scopes";
 
 const MCP_JSON_MAX_BYTES = 1_000_000;
@@ -70,7 +71,7 @@ const toolDefs: ToolDef[] = ([
   { name: "set_share_public", title: "Set public sharing", description: "Enable or disable public link sharing. Requires confirm=true because it changes access permissions.", inputSchema: { notebookId, public: z.boolean(), confirm: z.literal(true) }, outputSchema: { notebookId: z.string(), isPublic: z.boolean(), shareUrl: z.string().nullable() }, annotations: { readOnlyHint: false, destructiveHint: true }, run: async (c, a) => c.setSharePublic({ notebookId: String(a.notebookId), public: Boolean(a.public), confirm: true }) }
 ] as Array<Omit<ToolDef, "requiredScopes">>).map((def) => ({ ...def, requiredScopes: requiredScopesForTool(def.name) }));
 
-export async function handleMcpRequest(request: Request, env: Env, auth: { envelope: NotebookLMCredentialEnvelope; scopes: readonly NotebookLMScope[] }): Promise<Response> {
+export async function handleMcpRequest(request: Request, env: Env, auth: { envelope: NotebookLMCredentialEnvelope; scopes: readonly NotebookLMScope[] }, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
   let parsedBody: unknown;
   try { parsedBody = JSON.parse(await readTextWithLimit(request, MCP_JSON_MAX_BYTES)); } catch (error) {
@@ -82,10 +83,11 @@ export async function handleMcpRequest(request: Request, env: Env, auth: { envel
   for (const def of toolDefs.filter((tool) => hasRequiredScopes(auth.scopes, tool.requiredScopes))) {
     server.registerTool(def.name, { title: def.title, description: def.description, inputSchema: def.inputSchema, outputSchema: def.outputSchema, annotations: def.annotations }, async (args) => {
       try {
-        const payload = await runWithMocks(env, def, args as Record<string, unknown>, auth.envelope);
+        const payload = await runWithMocks(env, def, args as Record<string, unknown>, auth.envelope, ctx);
         return { structuredContent: payload, content: [{ type: "text", text: JSON.stringify(payload) }] };
       } catch (error) {
         const failure = describeFailure(error);
+        if (failure.stage === "auth_expired") ctx?.waitUntil(deleteSession(env, auth.envelope.credId));
         const traceId = crypto.randomUUID();
         const cookieAgeDays = Math.floor((Date.now() - Date.parse(auth.envelope.createdAt)) / 86_400_000);
         console.warn("NotebookLM tool failed", { tool: def.name, traceId, stage: failure.stage, status: failure.status, cookieAgeDays: Number.isFinite(cookieAgeDays) ? cookieAgeDays : undefined });
@@ -107,13 +109,19 @@ export async function handleMcpRequest(request: Request, env: Env, auth: { envel
   return response;
 }
 
-async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown>, envelope: NotebookLMCredentialEnvelope): Promise<Record<string, unknown>> {
+async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown>, envelope: NotebookLMCredentialEnvelope, ctx?: ExecutionContext): Promise<Record<string, unknown>> {
   if (def.name === "list_notebooks" && env.MOCK_NOTEBOOKLM_LIST_JSON) return { notebooks: z.array(notebookSchema).parse(JSON.parse(env.MOCK_NOTEBOOKLM_LIST_JSON)) };
   if (def.name === "rename_notebook" && env.MOCK_NOTEBOOKLM_RENAME_JSON) return { notebook: notebookSchema.parse(JSON.parse(env.MOCK_NOTEBOOKLM_RENAME_JSON)) };
   if (def.name === "delete_notebook" && env.MOCK_NOTEBOOKLM_DELETE_JSON) return z.object({ deleted: z.literal(true), notebookId: z.string() }).parse(JSON.parse(env.MOCK_NOTEBOOKLM_DELETE_JSON));
   const safeFetch: typeof fetch = (input, init) => fetch(input, init);
   const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
-  return def.run(client, args);
+  const payload = await def.run(client, args);
+  // Persist the rotated cookie jar so the next call — from this client, another
+  // client, or the cron keep-alive — does not start from the stale token snapshot.
+  const persist = persistSessionEnvelope(env, envelope, client).catch((error) =>
+    console.warn("NotebookLM session persist failed", { credId: envelope.credId, error: error instanceof Error ? error.name : "unknown" }));
+  if (ctx) ctx.waitUntil(persist); else await persist;
+  return payload;
 }
 
 function isInitializeRequest(body: unknown): boolean {
