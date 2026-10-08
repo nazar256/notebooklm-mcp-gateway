@@ -109,3 +109,18 @@ npx wrangler deploy
 - Old MCP profiles can hold expired access tokens. Re-run OAuth if refresh fails.
 
 When reporting a bug, include sanitized request shapes, tool names, status codes, trace IDs, and reproduction steps. Do not include cookies, tokens, private notebook data, or raw upstream bodies.
+
+## Troubleshooting tool failures
+
+Tool errors report a failure stage and trace ID:
+
+- `auth_expired` — upstream redirected to Google sign-in, returned an HTML login page, or rejected the session (401/403). Reconnect with a fresh Copy-as-cURL artifact.
+- `upstream_null` — batchexecute returned a well-formed response with a null payload for a required RPC. This is the typical signature of a stale session or stale CSRF token; reconnect if it persists.
+- `upstream_parse` — the response did not contain the expected RPC frame: a likely upstream schema change.
+- `upstream_http` / `auth_bootstrap_http` — non-2xx from NotebookLM (status included).
+- `auth_bootstrap_parse` — the NotebookLM shell page loaded but session fields were missing; markup change or partial session.
+- `runtime` — unexpected connector-side error.
+
+Rotated session cookies are re-baked into tokens on every refresh-token exchange (see ADR-011), so a connector that is used regularly keeps refreshing itself. If a connector is idle longer than Google's cookie-rotation grace window, reconnect with a fresh artifact.
+
+Workers Logs are enabled in `wrangler.jsonc`; `console.warn` entries include the tool name, stage, upstream HTTP status, and pasted-cookie age in days. Cookies, tokens, and upstream bodies are never logged.

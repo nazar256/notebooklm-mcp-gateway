@@ -87,8 +87,10 @@ export async function handleMcpRequest(request: Request, env: Env, auth: { envel
       } catch (error) {
         const failure = describeFailure(error);
         const traceId = crypto.randomUUID();
-        console.warn("NotebookLM tool failed", { tool: def.name, traceId, stage: failure.stage, status: failure.status });
-        return { isError: true, content: [{ type: "text", text: `NotebookLM ${def.name} failed at ${failure.stage}${failure.status ? ` (HTTP ${failure.status})` : ""}. Trace ID: ${traceId}. Check IDs, safety confirmations, and reconnect with a fresh browser auth artifact if this persists.` }] };
+        const cookieAgeDays = Math.floor((Date.now() - Date.parse(auth.envelope.createdAt)) / 86_400_000);
+        console.warn("NotebookLM tool failed", { tool: def.name, traceId, stage: failure.stage, status: failure.status, cookieAgeDays: Number.isFinite(cookieAgeDays) ? cookieAgeDays : undefined });
+        const hint = failureHint(failure.stage);
+        return { isError: true, content: [{ type: "text", text: `NotebookLM ${def.name} failed at ${failure.stage}${failure.status ? ` (HTTP ${failure.status})` : ""}. Trace ID: ${traceId}. ${hint}` }] };
       }
     });
   }
@@ -132,4 +134,10 @@ function describeFailure(error: unknown): { stage: string; status?: number } {
   if (error instanceof NotebookLMError) return { stage: error.stage, status: error.status };
   if (error instanceof z.ZodError) return { stage: "input_validation" };
   return { stage: "runtime" };
+}
+
+function failureHint(stage: string): string {
+  if (stage === "auth_expired") return "The NotebookLM browser session appears expired. Reconnect with a fresh browser auth artifact.";
+  if (stage === "upstream_null") return "NotebookLM returned an empty result for a required RPC — often an expired session. Reconnect with a fresh browser auth artifact.";
+  return "Check IDs, safety confirmations, and reconnect with a fresh browser auth artifact if this persists.";
 }

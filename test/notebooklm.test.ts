@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildNotebookLMRpcResponse, decodeNotebookLMRpcRequest, NotebookLMClient } from "../src/notebooklm";
+import { buildNotebookLMRpcResponse, decodeNotebookLMRpcRequest, NotebookLMClient, NotebookLMError } from "../src/notebooklm";
 
 const bootstrapHtml = `<!doctype html><script>{"SNlM0e":"csrf-token","FdrFJe":"session-id"}</script>`;
 const cookieHeader = "SID=safe-sid; __Secure-1PSID=safe-psid";
@@ -384,6 +384,124 @@ describe("NotebookLMClient", () => {
     const config = inner[6] as unknown[];
     const configInner = (config[1] as unknown[]) ?? [];
     expect(configInner[1]).toBe(2); // default medium length
+  });
+
+  it("merges rotated Set-Cookie session cookies into subsequent upstream requests", async () => {
+    const calls: Array<{ url: string; cookie: string | null }> = [];
+    const bootstrapHeaders = new Headers();
+    bootstrapHeaders.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly");
+    bootstrapHeaders.append("set-cookie", "SIDCC=rotated-sidcc; Path=/");
+    bootstrapHeaders.append("set-cookie", "unrelated_tracker=x; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSID=psid-test",
+      fetch: async (input, init) => {
+        const url = String(input);
+        calls.push({ url, cookie: new Headers(init?.headers).get("cookie") });
+        if (url.endsWith("/")) return new Response(bootstrapHtml, { headers: bootstrapHeaders });
+        const rpc = decodeNotebookLMRpcRequest(typeof init?.body === "string" ? init.body : "");
+        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]));
+      }
+    });
+
+    await expect(client.listNotebooks()).resolves.toEqual([{ id: "nb-1", title: "Notebook One" }]);
+    const rpcCookie = calls[1]?.cookie ?? "";
+    expect(rpcCookie).toContain("SID=sid-test");
+    expect(rpcCookie).toContain("__Secure-1PSIDTS=rotated-ts");
+    expect(rpcCookie).toContain("SIDCC=rotated-sidcc");
+    expect(rpcCookie).not.toContain("unrelated_tracker");
+
+    // getCookieHeader exposes the merged snapshot for envelope refresh.
+    expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=rotated-ts");
+    expect(client.getCookieHeader()).toContain("__Secure-1PSID=psid-test");
+  });
+
+  it("reports auth_expired when bootstrap redirects to Google sign-in instead of using stale copied values", async () => {
+    const calls: Array<{ url: string }> = [];
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      sessionId: "copied-session",
+      csrfToken: "copied-csrf",
+      fetch: async (input) => {
+        calls.push({ url: String(input) });
+        return { ok: true, status: 200, url: "https://accounts.google.com/ServiceLogin?continue=x", text: async () => "<html>sign in</html>" } as Response;
+      }
+    });
+
+    const error = await client.listNotebooks().catch((e) => e);
+    expect(error).toBeInstanceOf(NotebookLMError);
+    expect((error as NotebookLMError).stage).toBe("auth_expired");
+    // No doomed RPC was attempted with stale copied bootstrap values.
+    expect(calls).toHaveLength(1);
+  });
+
+  it("reports auth_expired when bootstrap HTML is a Google login page", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      sessionId: "copied-session",
+      csrfToken: "copied-csrf",
+      fetch: async () => new Response('<html><form action="https://accounts.google.com/ServiceLogin"></form></html>')
+    });
+
+    const error = await client.listNotebooks().catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("auth_expired");
+  });
+
+  it("reports auth_expired when batchexecute returns an HTML login response", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        if (String(input).endsWith("/")) return new Response(bootstrapHtml);
+        return new Response("<html>login</html>", { headers: { "content-type": "text/html;charset=UTF-8" } });
+      }
+    });
+
+    const error = await client.listNotebooks().catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("auth_expired");
+  });
+
+  it("reports upstream_null when a required RPC returns a null payload", async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: mockFetch(calls, { rLM1Ne: null })
+    });
+
+    const error = await client.getNotebook("nb-1").catch((e) => e);
+    expect(error).toBeInstanceOf(NotebookLMError);
+    expect((error as NotebookLMError).stage).toBe("upstream_null");
+  });
+
+  it("keeps allowNull RPCs returning empty success on null payloads", async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: mockFetch(calls, { gArtLc: null })
+    });
+
+    await expect(client.listArtifacts("nb-1")).resolves.toEqual([]);
+  });
+
+  it("uses the live boq build label from bootstrap for the chat endpoint", async () => {
+    const calls: Array<{ url: string }> = [];
+    const html = `<!doctype html><script>{"SNlM0e":"csrf-token","FdrFJe":"session-id","cfb2h":"boq_labs-tailwind-frontend_29990101.01_p0"}</script>`;
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        calls.push({ url: String(input) });
+        if (String(input).endsWith("/")) return new Response(html);
+        return new Response(")]}'\n\n[]\n");
+      }
+    });
+
+    await client.askNotebook({ notebookId: "nb-1", question: "hi", sourceIds: ["src-1"], conversationId: "conv-1" });
+    expect(calls[1]?.url).toContain("bl=boq_labs-tailwind-frontend_29990101.01_p0");
   });
 });
 
