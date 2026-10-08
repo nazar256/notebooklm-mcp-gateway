@@ -58,7 +58,7 @@ The first public release does not implement per-tool OAuth scopes. Authorization
 
 Google rotates NotebookLM session cookies (`SIDCC`, `__Secure-*PSIDCC`, `__Secure-*PSIDTS` families) via `Set-Cookie` on upstream responses; a pasted Copy-as-cURL snapshot goes stale within days while the browser session keeps working. To stay within the stateless design (ADR-001), rotated cookies are persisted inside the encrypted credential envelope rather than server-side storage:
 
-- `NotebookLMClient` keeps a per-invocation cookie jar: every upstream response's allowlisted `Set-Cookie` updates are merged and sent on subsequent upstream calls.
-- On every refresh-token exchange the Worker pings NotebookLM, harvests the rotated cookies, and bakes the merged cookie header into the re-encrypted envelope carried by the new access and refresh tokens. Failures reuse the previous envelope so token rotation never breaks.
+- `NotebookLMClient` keeps a per-invocation cookie jar: every upstream response's allowlisted `Set-Cookie` updates are merged and sent on subsequent upstream calls. Expired `Set-Cookie` values (`Max-Age<=0`, past `Expires`) delete jar entries, and sign-in responses never contribute cookies — a dead session cannot leak another account's cookies into the jar.
+- On every refresh-token exchange the Worker pings NotebookLM (bootstrap plus a read-only RPC, so batchexecute-level rotations are captured too) and bakes the merged cookie header into the re-encrypted envelope carried by the new access and refresh tokens. Failures reuse the previous envelope so token rotation never breaks.
 
 Sessions can still expire when no refresh happens inside Google's grace window, or when Google invalidates the underlying session. Those cases surface as distinct failure stages (`auth_expired` for sign-in redirects/HTML/401/403, `upstream_null` for required RPC frames with null payloads) instead of a generic `upstream_parse`.

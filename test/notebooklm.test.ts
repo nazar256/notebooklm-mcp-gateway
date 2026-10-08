@@ -416,6 +416,63 @@ describe("NotebookLMClient", () => {
     expect(client.getCookieHeader()).toContain("__Secure-1PSID=psid-test");
   });
 
+  it("refreshCookies captures Set-Cookie rotation from an authenticated RPC, not only the shell", async () => {
+    const rpcHeaders = new Headers();
+    rpcHeaders.append("set-cookie", "SIDCC=rotated-by-rpc; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const rpc = decodeNotebookLMRpcRequest(typeof init?.body === "string" ? init.body : "");
+        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]), { headers: rpcHeaders });
+      }
+    });
+
+    await client.refreshCookies();
+    expect(client.getCookieHeader()).toContain("SIDCC=rotated-by-rpc");
+    expect(client.getCookieHeader()).toContain("SID=sid-test");
+  });
+
+  it("drops cookies deleted upstream via Max-Age=0 instead of persisting the dead value", async () => {
+    const calls: Array<{ url: string; cookie: string | null }> = [];
+    const bootstrapHeaders = new Headers();
+    bootstrapHeaders.append("set-cookie", "SIDCC=dead-but-nonempty; Max-Age=0; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; SIDCC=old-sidcc; 1P_JAR=keep-pasted",
+      fetch: async (input, init) => {
+        const url = String(input);
+        calls.push({ url, cookie: new Headers(init?.headers).get("cookie") });
+        if (url.endsWith("/")) return new Response(bootstrapHtml, { headers: bootstrapHeaders });
+        const rpc = decodeNotebookLMRpcRequest(typeof init?.body === "string" ? init.body : "");
+        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]));
+      }
+    });
+
+    await client.listNotebooks();
+    const rpcCookie = calls[1]?.cookie ?? "";
+    expect(rpcCookie).not.toContain("SIDCC");
+    expect(rpcCookie).toContain("1P_JAR=keep-pasted");
+    expect(client.getCookieHeader()).not.toContain("SIDCC");
+    expect(client.getCookieHeader()).toContain("1P_JAR=keep-pasted");
+  });
+
+  it("refreshCookies keeps the original jar when the session is expired instead of foreign sign-in cookies", async () => {
+    const loginHeaders = new Headers();
+    loginHeaders.append("set-cookie", "SIDCC=foreign-account-sidcc; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
+      fetch: async () => new Response('<html><form action="https://accounts.google.com/ServiceLogin"></form></html>', { headers: loginHeaders })
+    });
+
+    await client.refreshCookies();
+    expect(client.getCookieHeader()).toContain("SIDCC=old-sidcc");
+    expect(client.getCookieHeader()).not.toContain("foreign-account-sidcc");
+  });
+
   it("reports auth_expired when bootstrap redirects to Google sign-in instead of using stale copied values", async () => {
     const calls: Array<{ url: string }> = [];
     const client = new NotebookLMClient({

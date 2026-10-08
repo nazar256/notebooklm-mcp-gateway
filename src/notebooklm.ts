@@ -90,22 +90,28 @@ export class NotebookLMClient {
 
   // Google rotates session cookies (SIDCC/PSIDCC/PSIDTS families) via Set-Cookie on
   // nearly every response. Tracking them here keeps the pasted snapshot fresher for
-  // the life of this invocation, and lets callers persist the rotated values.
+  // the life of this invocation, and lets callers persist the rotated values. The jar
+  // starts from the pasted header, so non-allowlisted pasted cookies keep being sent;
+  // an emptied jar stays empty rather than resurrecting deleted cookies.
   getCookieHeader(): string {
-    const merged = [...this.cookieJar.entries()]
-      .filter(([name]) => notebookLmCookieAllowlist.has(name))
+    return [...this.cookieJar.entries()]
       .map(([name, value]) => `${name}=${value}`)
       .join("; ");
-    return merged || this.cookieHeader;
   }
 
   // Best-effort upstream session ping whose only purpose is collecting Set-Cookie
-  // rotation. Errors are swallowed: whatever cookies were set are still captured.
+  // rotation. Runs a real authenticated RPC, not just the shell, so batchexecute-level
+  // rotations are captured too. Errors are swallowed; on auth_expired the jar is
+  // restored so a dead session cannot persist cookies from a sign-in response.
   async refreshCookies(): Promise<void> {
+    const seeded = new Map(this.cookieJar);
     try {
-      await this.bootstrap();
-    } catch {
-      // A failing bootstrap may still carry Set-Cookie rotation worth keeping.
+      await this.validateAuthentication();
+    } catch (error) {
+      if (error instanceof NotebookLMError && error.stage === "auth_expired") {
+        this.cookieJar.clear();
+        for (const [name, value] of seeded) this.cookieJar.set(name, value);
+      }
     }
   }
 
@@ -435,20 +441,22 @@ export class NotebookLMClient {
 
   private async upstreamFetch(input: string | URL, init?: RequestInit): Promise<Response> {
     const response = await this.fetchImpl(input, init);
-    this.captureSetCookies(response.headers);
+    // Sign-in pages may set allowlisted cookies for accounts.google.com — those belong
+    // to a different account context and must never enter the jar.
+    if (!isLoginUrl(response.url)) this.captureSetCookies(response.headers);
     return response;
   }
 
   private captureSetCookies(headers: Headers | undefined): void {
     const setCookies = headers?.getSetCookie?.() ?? [];
     for (const raw of setCookies) {
-      const pair = raw.split(";", 1)[0] ?? "";
+      const [pair, ...attributes] = raw.split(";");
       const separator = pair.indexOf("=");
       if (separator <= 0) continue;
       const name = pair.slice(0, separator).trim();
       const value = pair.slice(separator + 1).trim();
       if (!notebookLmCookieAllowlist.has(name)) continue;
-      if (value) this.cookieJar.set(name, value);
+      if (value && !isExpiredSetCookie(attributes)) this.cookieJar.set(name, value);
       else this.cookieJar.delete(name);
     }
   }
@@ -822,6 +830,19 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
     throw new Error("NotebookLM response did not include expected RPC result");
   }
   return result;
+}
+
+// A Set-Cookie can delete a cookie with a nonempty value via Max-Age<=0 or a past
+// Expires date; both must remove the jar entry regardless of the value carried.
+function isExpiredSetCookie(attributes: string[]): boolean {
+  for (const attribute of attributes) {
+    const [key, rawValue = ""] = attribute.split("=", 2);
+    const name = key.trim().toLowerCase();
+    const value = rawValue.trim();
+    if (name === "max-age" && Number(value) <= 0) return true;
+    if (name === "expires" && Number.isFinite(Date.parse(value)) && Date.parse(value) <= Date.now()) return true;
+  }
+  return false;
 }
 
 function isLoginUrl(responseUrl: string | undefined): boolean {
