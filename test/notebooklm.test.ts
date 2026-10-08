@@ -509,6 +509,24 @@ describe("NotebookLMClient", () => {
     expect(client.getCookieHeader()).not.toContain("foreign-account-sidcc");
   });
 
+  it("refreshCookies discards cookies captured during a failed refresh ping", async () => {
+    const rpcHeaders = new Headers();
+    rpcHeaders.append("set-cookie", "SIDCC=from-failed-rpc; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        return new Response(")]}'\n\n[]\n", { headers: rpcHeaders });
+      }
+    });
+
+    await expect(client.refreshCookies()).resolves.toBe(false);
+    expect(client.getCookieHeader()).toContain("SIDCC=old-sidcc");
+    expect(client.getCookieHeader()).not.toContain("from-failed-rpc");
+  });
+
   it("reports auth_expired when bootstrap redirects to Google sign-in instead of using stale copied values", async () => {
     const calls: Array<{ url: string }> = [];
     const client = new NotebookLMClient({

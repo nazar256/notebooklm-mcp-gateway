@@ -1,6 +1,7 @@
 import { decodeJwt, SignJWT } from "jose";
 import { describe, expect, it, vi } from "vitest";
 import { base64ToBytes, decryptEnvelope, encryptEnvelope, pkceS256, signJwt } from "../src/crypto";
+import { buildNotebookLMRpcResponse } from "../src/notebooklm";
 import { env, fetchWorker, registerClient, sampleCookie } from "./helpers";
 
 async function authorizeAndExchange(scope: string, selectedScopes = scope) {
@@ -293,12 +294,16 @@ describe("OAuth", () => {
     const { clientId, tokenBody } = await authorizeAndExchange("notebooklm:read");
     const noMockEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("MOCK_")));
     const bootstrapHtml = `<!doctype html><script>{"SNlM0e":"csrf","FdrFJe":"sid"}</script>`;
-    vi.stubGlobal("fetch", async () => {
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = String(input);
       const headers = new Headers();
-      headers.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly");
-      headers.append("set-cookie", "SIDCC=rotated-sidcc; Path=/");
-      headers.append("set-cookie", "unrelated_tracker=x; Path=/");
-      return new Response(bootstrapHtml, { headers });
+      if (url.endsWith("/")) {
+        headers.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly");
+        headers.append("set-cookie", "SIDCC=rotated-sidcc; Path=/");
+        headers.append("set-cookie", "unrelated_tracker=x; Path=/");
+        return new Response(bootstrapHtml, { headers });
+      }
+      return new Response(buildNotebookLMRpcResponse("wXbhsf", [[["nb-1", "Notebook 1"]]]));
     });
     try {
       const refreshed = await fetchWorker("/token", { method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokenBody.refresh_token, client_id: clientId }) }, noMockEnv);
