@@ -26,8 +26,30 @@ export function b64Bytes(length: number): string {
   return Buffer.alloc(length, 7).toString("base64");
 }
 
-export async function fetchWorker(path: string, init?: RequestInit, testEnv: Record<string, unknown> = env): Promise<Response> {
-  return worker.fetch(new Request(`http://localhost:8787${path}`, init), testEnv);
+export function fakeKv(store = new Map<string, string>()): KVNamespace {
+  return {
+    get: async (key: string) => store.get(key) ?? null,
+    put: async (key: string, value: string) => { store.set(key, value); },
+    delete: async (key: string) => { store.delete(key); },
+    list: async (options?: { prefix?: string; cursor?: string }) => ({
+      keys: [...store.keys()].filter((name) => !options?.prefix || name.startsWith(options.prefix)).map((name) => ({ name })),
+      list_complete: true,
+      cursor: ""
+    })
+  } as unknown as KVNamespace;
+}
+
+export function fakeCtx(): ExecutionContext & { pending: Promise<unknown>[] } {
+  const pending: Promise<unknown>[] = [];
+  return {
+    pending,
+    waitUntil: (p: Promise<unknown>) => { pending.push(p); },
+    passThroughOnException: () => {}
+  } as unknown as ExecutionContext & { pending: Promise<unknown>[] };
+}
+
+export async function fetchWorker(path: string, init?: RequestInit, testEnv: Record<string, unknown> = env, ctx?: ExecutionContext): Promise<Response> {
+  return worker.fetch(new Request(`http://localhost:8787${path}`, init), testEnv, ctx);
 }
 
 export async function registerClient(redirectUri = "http://127.0.0.1:3555/callback"): Promise<string> {

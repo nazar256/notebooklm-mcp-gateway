@@ -104,15 +104,15 @@ export class NotebookLMClient {
   // rotations are captured too. The jar is persisted only on a fully successful ping:
   // on any failure it is restored to the seed, so cookies captured during a rejected
   // or half-dead exchange can never poison refreshed tokens.
-  async refreshCookies(): Promise<boolean> {
+  async refreshCookies(): Promise<"alive" | "expired" | "failed"> {
     const seeded = new Map(this.cookieJar);
     try {
       await this.validateAuthentication();
-      return true;
-    } catch {
+      return "alive";
+    } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
-      return false;
+      return error instanceof NotebookLMError && error.stage === "auth_expired" ? "expired" : "failed";
     }
   }
 

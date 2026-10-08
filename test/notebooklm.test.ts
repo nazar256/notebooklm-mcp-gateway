@@ -504,7 +504,7 @@ describe("NotebookLMClient", () => {
       fetch: async () => new Response('<html><form action="https://accounts.google.com/ServiceLogin"></form></html>', { headers: loginHeaders })
     });
 
-    await client.refreshCookies();
+    await expect(client.refreshCookies()).resolves.toBe("expired");
     expect(client.getCookieHeader()).toContain("SIDCC=old-sidcc");
     expect(client.getCookieHeader()).not.toContain("foreign-account-sidcc");
   });
@@ -522,7 +522,7 @@ describe("NotebookLMClient", () => {
       }
     });
 
-    await expect(client.refreshCookies()).resolves.toBe(false);
+    await expect(client.refreshCookies()).resolves.toBe("failed");
     expect(client.getCookieHeader()).toContain("SIDCC=old-sidcc");
     expect(client.getCookieHeader()).not.toContain("from-failed-rpc");
   });

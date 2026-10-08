@@ -2,10 +2,11 @@ import { parseEnv, type Env } from "./config";
 import { AuthArtifactError } from "./authArtifact";
 import { authenticateMcp, authorizeGet, authorizePost, mcpChallenge, metadata, protectedResourceMetadata, register, token } from "./oauth";
 import { handleMcpRequest } from "./mcp";
+import { keepAliveSessions } from "./sessionStore";
 import { RequestBodyTooLargeError } from "./http";
 
 export default {
-  async fetch(request: Request, rawEnv: unknown): Promise<Response> {
+  async fetch(request: Request, rawEnv: unknown, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     let env: Env;
     try {
@@ -32,12 +33,22 @@ export default {
           return mcpChallenge(env, "invalid_token");
         }
         if (!auth) return mcpChallenge(env);
-        return await handleMcpRequest(request, env, auth);
+        return await handleMcpRequest(request, env, auth, ctx);
       }
       return new Response("Not Found", { status: 404 });
     } catch (error) {
       return sanitizedError(error);
     }
+  },
+
+  async scheduled(_controller: ScheduledController, rawEnv: unknown, ctx: ExecutionContext): Promise<void> {
+    let env: Env;
+    try {
+      env = parseEnv(rawEnv);
+    } catch {
+      return;
+    }
+    ctx.waitUntil(keepAliveSessions(env).catch((error) => console.warn("NotebookLM keep-alive run failed", { error: error instanceof Error ? error.name : "unknown" })));
   }
 };
 

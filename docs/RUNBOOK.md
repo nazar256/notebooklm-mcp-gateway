@@ -124,3 +124,9 @@ Tool errors report a failure stage and trace ID:
 Rotated session cookies are re-baked into tokens on every refresh-token exchange (see ADR-011), so a connector that is used regularly keeps refreshing itself. If a connector is idle longer than Google's cookie-rotation grace window, reconnect with a fresh artifact.
 
 Workers Logs are enabled in `wrangler.jsonc`; `console.warn` entries include the tool name, stage, upstream HTTP status, and pasted-cookie age in days. Cookies, tokens, and upstream bodies are never logged.
+
+## Session store (KV) and keep-alive cron
+
+Connected credentials get a stable `credId` and one KV entry (`cred:<credId>`) in the `NOTEBOOKLM_SESSION_KV` namespace holding the encrypted session envelope. The deploy workflow creates the `notebooklm-mcp-session-kv` namespace via the Cloudflare API if missing — `CLOUDFLARE_API_TOKEN` needs Workers KV Storage edit permission. `wrangler.jsonc` ships a `__NOTEBOOKLM_SESSION_KV_ID__` placeholder the workflow fills at deploy time.
+
+A `15 */3 * * *` cron (`scheduled` handler) pings NotebookLM for every stored credential and either persists the rotated jar or evicts dead sessions. Watch `NotebookLM session keep-alive` log entries for per-credential outcomes and `NotebookLM credential refresh` for refresh-exchange cookie diffs (cookie names only, never values).

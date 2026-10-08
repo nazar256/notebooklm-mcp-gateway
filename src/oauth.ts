@@ -4,6 +4,7 @@ import { AuthArtifactError, parseCookieHeader, parseNotebookLMAuthArtifact } fro
 import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt, type EncryptedEnvelope } from "./crypto";
 import { parseUniqueUrlEncoded, readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
+import { loadSessionEnvelope, persistSessionEnvelope } from "./sessionStore";
 import { baselineScope, formatScopes, grantScopesFromConsent, notebookLmScopes, parseGrantedScopes, parseRequestedScopes, scopeLabels, type NotebookLMScope } from "./scopes";
 
 const REGISTER_MAX_BYTES = 64_000;
@@ -175,7 +176,11 @@ export async function authenticateMcp(request: Request, env: Env) {
   if (!match) return null;
   const claims = await verifyJwt(match[1], env.OAUTH_JWT_SIGNING_KEY_B64, env.OAUTH_ISSUER, env.MCP_AUDIENCE, accessTokenClaimsSchema);
   if (Date.parse(claims.connector_expires_at) <= Date.now()) throw new Error("expired_connector");
-  return { envelope: await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64), scopes: parseGrantedScopes(claims.scope) };
+  const envelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+  // The KV session store is authoritative for the rotating cookie jar; the
+  // token-carried envelope is only the fallback snapshot.
+  const stored = await loadSessionEnvelope(env, envelope.credId);
+  return { envelope: stored ? { ...envelope, cookieHeader: stored.cookieHeader } : envelope, scopes: parseGrantedScopes(claims.scope) };
 }
 
 export function mcpChallenge(env: Env, error?: "invalid_token"): Response {
@@ -284,12 +289,18 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     const envelope = await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
     const safeFetch: typeof fetch = (input, init) => fetch(input, init);
     const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
-    const alive = await client.refreshCookies();
+    const ping = await client.refreshCookies();
     const cookieHeader = client.getCookieHeader();
     console.log("NotebookLM credential refresh", {
-      alive,
+      ping,
+      credId: envelope.credId,
       cookieDiff: sanitizeCookieDiff(envelope.cookieHeader, cookieHeader)
     });
+    if (ping === "alive") {
+      // Persist the rotated jar into the shared session store so subsequent
+      // calls pick it up without waiting for the next token exchange.
+      await persistSessionEnvelope(env, envelope, client);
+    }
     if (!cookieHeader || cookieHeader === envelope.cookieHeader) return credential;
     return await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
   } catch (error) {

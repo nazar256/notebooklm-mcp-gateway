@@ -62,3 +62,17 @@ Google rotates NotebookLM session cookies (`SIDCC`, `__Secure-*PSIDCC`, `__Secur
 - On every refresh-token exchange the Worker pings NotebookLM (bootstrap plus a read-only RPC, so batchexecute-level rotations are captured too) and bakes the merged cookie header into the re-encrypted envelope carried by the new access and refresh tokens. Failures reuse the previous envelope so token rotation never breaks.
 
 Sessions can still expire when no refresh happens inside Google's grace window, or when Google invalidates the underlying session. Those cases surface as distinct failure stages (`auth_expired` for sign-in redirects/HTML/401/403, `upstream_null` for required RPC frames with null payloads) instead of a generic `upstream_parse`.
+
+## ADR-012: Shared session jar in Workers KV with a cron keep-alive
+
+ADR-011's stateless jar has a structural gap: the cookie jar lives only inside one invocation, so rotations captured during a call persist only when the MCP client happens to do a refresh-token exchange. Clients that rarely refresh leave every call starting from the stale token snapshot, and idle connectors die within Google's rotation grace window.
+
+To close this, each parsed auth artifact now gets a stable `credId` (UUID) inside its encrypted envelope, and the Worker keeps one authoritative session envelope per credential in Workers KV (`NOTEBOOKLM_SESSION_KV`, keys `cred:<credId>`):
+
+- KV values are the same AES-GCM envelope shape tokens carry — cookies are never stored in plaintext (ADR-002 still holds; only the storage location of ciphertext changed).
+- `authenticateMcp` prefers the KV jar's `cookieHeader` over the token snapshot. Every successful tool call persists the rotated jar back via `waitUntil`. Refresh exchanges persist it too.
+- `refreshCookies` persists the jar only on a fully successful upstream ping; on any failure the seeded jar is restored so a rejected or half-dead exchange can never poison stored cookies.
+- An `auth_expired` result (sign-in redirect, login HTML, 401/403) evicts the KV entry — it is a reliable dead-session signal, and eviction stops further keep-alive churn.
+- A `scheduled` trigger (`15 */3 * * *`) replays every stored credential through the same read-only ping, accumulating rotations while clients are idle and evicting expired credentials.
+
+This intentionally relaxes ADR-001: the Worker keeps no OAuth state (tokens are still fully self-contained) but does keep server-side *session* state. Old envelopes without `credId` simply keep working statelessly.
