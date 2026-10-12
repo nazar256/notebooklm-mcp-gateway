@@ -304,7 +304,10 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     const cookieHeader = client.getCookieHeader();
     // Message string carries the diagnostics: Cloudflare Observability does not
     // index structured log arguments.
-    console.log(`NotebookLM credential refresh ping=${ping} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(envelope.cookieHeader, cookieHeader)}`);
+    // Diff against the ping seed (KV jar when present), not the token snapshot:
+    // the token header can be older than KV, which would misattribute earlier
+    // rotations to this ping.
+    console.log(`NotebookLM credential refresh ping=${ping} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(seedHeader, cookieHeader)}`);
     if (ping === "alive") {
       // Persist the rotated jar into the shared session store so subsequent
       // calls pick it up without waiting for the next token exchange.

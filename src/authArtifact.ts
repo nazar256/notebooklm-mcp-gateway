@@ -323,10 +323,19 @@ export function sanitizeCookieDiff(before: string, after: string): { updated: st
 
 // Flat string form of sanitizeCookieDiff — Cloudflare Observability only indexes
 // the message text, not structured log arguments, so diagnostics belong in the
-// string itself.
+// string itself. Only allowlisted (known NotebookLM session) names are logged
+// verbatim: upstream can set arbitrary cookie names, and an unrecognized name
+// could carry attacker- or server-controlled data into searchable logs.
 export function formatCookieDiff(before: string, after: string): string {
   const diff = sanitizeCookieDiff(before, after);
-  return `updated=[${diff.updated.join(",")}] added=[${diff.added.join(",")}] deleted=[${diff.deleted.join(",")}]`;
+  return `updated=${formatCookieNames(diff.updated)} added=${formatCookieNames(diff.added)} deleted=${formatCookieNames(diff.deleted)}`;
+}
+
+function formatCookieNames(names: string[]): string {
+  const known = names.filter((name) => notebookLmCookieAllowlist.has(name));
+  const other = names.length - known.length;
+  const suffix = other > 0 ? `${known.length > 0 ? "," : ""}+${other} unrecognized` : "";
+  return `[${known.join(",")}${suffix}]`;
 }
 
 function compactCookieHeader(cookieHeader: string): string {
