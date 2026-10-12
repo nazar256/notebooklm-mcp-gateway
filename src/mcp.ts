@@ -90,7 +90,9 @@ export async function handleMcpRequest(request: Request, env: Env, auth: { envel
         if (failure.stage === "auth_expired") ctx?.waitUntil(deleteSession(env, auth.envelope.credId));
         const traceId = crypto.randomUUID();
         const cookieAgeDays = Math.floor((Date.now() - Date.parse(auth.envelope.createdAt)) / 86_400_000);
-        console.warn("NotebookLM tool failed", { tool: def.name, traceId, stage: failure.stage, status: failure.status, cookieAgeDays: Number.isFinite(cookieAgeDays) ? cookieAgeDays : undefined });
+        // Message string carries the diagnostics: Cloudflare Observability does
+        // not index structured log arguments.
+        console.warn(`NotebookLM tool failed tool=${def.name} stage=${failure.stage} status=${failure.status ?? "-"} traceId=${traceId} cookieAgeDays=${Number.isFinite(cookieAgeDays) ? cookieAgeDays : "-"} cred=${(auth.envelope.credId ?? "-").slice(0, 8)}`);
         const hint = failureHint(failure.stage);
         return { isError: true, content: [{ type: "text", text: `NotebookLM ${def.name} failed at ${failure.stage}${failure.status ? ` (HTTP ${failure.status})` : ""}. Trace ID: ${traceId}. ${hint}` }] };
       }
@@ -119,7 +121,7 @@ async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown
   // Persist the rotated cookie jar so the next call — from this client, another
   // client, or the cron keep-alive — does not start from the stale token snapshot.
   const persist = persistSessionEnvelope(env, envelope, client).catch((error) =>
-    console.warn("NotebookLM session persist failed", { credId: envelope.credId, error: error instanceof Error ? error.name : "unknown" }));
+    console.warn(`NotebookLM session persist failed cred=${(envelope.credId ?? "-").slice(0, 8)} error=${error instanceof Error ? error.name : "unknown"}`));
   if (ctx) ctx.waitUntil(persist); else await persist;
   return payload;
 }

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Env } from "./config";
-import { AuthArtifactError, parseCookieHeader, parseNotebookLMAuthArtifact } from "./authArtifact";
+import { AuthArtifactError, formatCookieDiff, parseNotebookLMAuthArtifact } from "./authArtifact";
 import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt, type EncryptedEnvelope } from "./crypto";
 import { parseUniqueUrlEncoded, readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
@@ -302,11 +302,9 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: seedHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
     const ping = await client.refreshCookies();
     const cookieHeader = client.getCookieHeader();
-    console.log("NotebookLM credential refresh", {
-      ping,
-      credId: envelope.credId,
-      cookieDiff: sanitizeCookieDiff(envelope.cookieHeader, cookieHeader)
-    });
+    // Message string carries the diagnostics: Cloudflare Observability does not
+    // index structured log arguments.
+    console.log(`NotebookLM credential refresh ping=${ping} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(envelope.cookieHeader, cookieHeader)}`);
     if (ping === "alive") {
       // Persist the rotated jar into the shared session store so subsequent
       // calls pick it up without waiting for the next token exchange.
@@ -315,25 +313,11 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     if (!cookieHeader || cookieHeader === envelope.cookieHeader) return credential;
     return await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
   } catch (error) {
-    console.warn("NotebookLM credential refresh failed", { error: error instanceof Error ? error.name : "unknown" });
+    console.warn(`NotebookLM credential refresh failed error=${error instanceof Error ? error.name : "unknown"}`);
     return credential;
   }
 }
 
-// Names-only diff of two cookie headers — never log cookie values.
-function sanitizeCookieDiff(before: string, after: string): { updated: string[]; deleted: string[]; added: string[] } {
-  const oldCookies = parseCookieHeader(before);
-  const newCookies = parseCookieHeader(after);
-  const updated: string[] = [];
-  const deleted: string[] = [];
-  const added: string[] = [];
-  for (const [name, value] of newCookies) {
-    if (!oldCookies.has(name)) added.push(name);
-    else if (oldCookies.get(name) !== value) updated.push(name);
-  }
-  for (const name of oldCookies.keys()) if (!newCookies.has(name)) deleted.push(name);
-  return { updated, deleted, added };
-}
 
 async function validateNotebookLMCredentials(envelope: ReturnType<typeof parseNotebookLMAuthArtifact>, env: Env): Promise<string | null> {
   if (env.MOCK_NOTEBOOKLM_LIST_JSON) {
