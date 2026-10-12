@@ -1,5 +1,5 @@
 import type { NotebookLMCredentialEnvelope } from "./authArtifact";
-import { parseCookieHeader } from "./authArtifact";
+import { formatCookieDiff, parseCookieHeader } from "./authArtifact";
 import type { Env } from "./config";
 import { decryptEnvelope, encryptedEnvelopeSchema, encryptEnvelope, type EncryptedEnvelope } from "./crypto";
 import { NotebookLMClient } from "./notebooklm";
@@ -93,18 +93,22 @@ export async function keepAliveSessions(env: Env): Promise<{ kept: number; expir
     const page = await kv.list({ prefix: KEY_PREFIX, cursor });
     for (const key of page.keys) {
       const outcome = await keepAliveOne(env, kv, key.name);
-      counts[outcome] += 1;
-      console.log("NotebookLM session keep-alive", { credId: key.name.slice(KEY_PREFIX.length), outcome });
+      counts[outcome.status] += 1;
+      // Message string carries the diagnostics: Cloudflare Observability does
+      // not index structured log arguments.
+      console.log(`NotebookLM session keep-alive cred=${key.name.slice(KEY_PREFIX.length, KEY_PREFIX.length + 8)} outcome=${outcome.status}${outcome.diff ? ` ${outcome.diff}` : ""}`);
     }
     cursor = page.list_complete ? undefined : page.cursor || undefined;
   } while (cursor);
-  console.log("NotebookLM session keep-alive done", counts);
+  console.log(`NotebookLM session keep-alive done kept=${counts.kept} expired=${counts.expired} failed=${counts.failed}`);
   return counts;
 }
 
-async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise<"kept" | "expired" | "failed"> {
+type KeepAliveOutcome = { status: "kept" | "expired" | "failed"; diff?: string };
+
+async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise<KeepAliveOutcome> {
   const stored = await loadSessionEnvelope(env, keyName.slice(KEY_PREFIX.length));
-  if (!stored) return "failed";
+  if (!stored) return { status: "failed" };
   try {
     const client = new NotebookLMClient({
       baseUrl: stored.baseUrl,
@@ -118,14 +122,14 @@ async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise
     const ping = await client.refreshCookies();
     if (ping === "alive") {
       await persistSessionEnvelope(env, stored, client, stored.cookieHeader);
-      return "kept";
+      return { status: "kept", diff: formatCookieDiff(stored.cookieHeader, client.getCookieHeader()) };
     }
     if (ping === "expired") {
       await kv.delete(keyName);
-      return "expired";
+      return { status: "expired" };
     }
-    return "failed";
+    return { status: "failed" };
   } catch {
-    return "failed";
+    return { status: "failed" };
   }
 }

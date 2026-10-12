@@ -306,6 +306,38 @@ export function parseCookieHeader(cookieHeader: string): Map<string, string> {
   return cookies;
 }
 
+// Names-only diff of two cookie headers — never log or expose cookie values.
+export function sanitizeCookieDiff(before: string, after: string): { updated: string[]; deleted: string[]; added: string[] } {
+  const oldCookies = parseCookieHeader(before);
+  const newCookies = parseCookieHeader(after);
+  const updated: string[] = [];
+  const deleted: string[] = [];
+  const added: string[] = [];
+  for (const [name, value] of newCookies) {
+    if (!oldCookies.has(name)) added.push(name);
+    else if (oldCookies.get(name) !== value) updated.push(name);
+  }
+  for (const name of oldCookies.keys()) if (!newCookies.has(name)) deleted.push(name);
+  return { updated, deleted, added };
+}
+
+// Flat string form of sanitizeCookieDiff — Cloudflare Observability only indexes
+// the message text, not structured log arguments, so diagnostics belong in the
+// string itself. Only allowlisted (known NotebookLM session) names are logged
+// verbatim: upstream can set arbitrary cookie names, and an unrecognized name
+// could carry attacker- or server-controlled data into searchable logs.
+export function formatCookieDiff(before: string, after: string): string {
+  const diff = sanitizeCookieDiff(before, after);
+  return `updated=${formatCookieNames(diff.updated)} added=${formatCookieNames(diff.added)} deleted=${formatCookieNames(diff.deleted)}`;
+}
+
+function formatCookieNames(names: string[]): string {
+  const known = names.filter((name) => notebookLmCookieAllowlist.has(name));
+  const other = names.length - known.length;
+  const suffix = other > 0 ? `${known.length > 0 ? "," : ""}+${other} unrecognized` : "";
+  return `[${known.join(",")}${suffix}]`;
+}
+
 function compactCookieHeader(cookieHeader: string): string {
   const cookies = new Map<string, string>();
   for (const part of cookieHeader.split(";")) {

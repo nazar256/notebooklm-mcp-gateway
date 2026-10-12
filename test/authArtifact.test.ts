@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseNotebookLMAuthArtifact, safeArtifactReport } from "../src/authArtifact";
+import { formatCookieDiff, parseNotebookLMAuthArtifact, safeArtifactReport } from "../src/authArtifact";
 import { sampleCookie } from "./helpers";
 
 describe("auth artifact parser", () => {
@@ -105,5 +105,17 @@ describe("auth artifact parser", () => {
     expect(report).toContain("Cookie length:");
     expect(report).not.toContain("sid-test-value");
     expect(report).not.toContain("psid-test-value");
+  });
+});
+
+describe("formatCookieDiff", () => {
+  it("names allowlisted cookies and counts unrecognized ones without naming them", () => {
+    const before = "SID=old; NID=n1; some-crafted-name=x";
+    const after = "SID=new; NID=n1; some-crafted-name=y; __Secure-1PSIDCC=added";
+    const diff = formatCookieDiff(before, after);
+    expect(diff).toContain("SID");
+    expect(diff).toContain("__Secure-1PSIDCC");
+    expect(diff).not.toContain("some-crafted-name");
+    expect(diff).toContain("+1 unrecognized");
   });
 });

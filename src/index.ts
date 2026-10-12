@@ -48,7 +48,7 @@ export default {
     } catch {
       return;
     }
-    ctx.waitUntil(keepAliveSessions(env).catch((error) => console.warn("NotebookLM keep-alive run failed", { error: error instanceof Error ? error.name : "unknown" })));
+    ctx.waitUntil(keepAliveSessions(env).catch((error) => console.warn(`NotebookLM keep-alive run failed error=${error instanceof Error ? error.name : "unknown"}`)));
   }
 };
 

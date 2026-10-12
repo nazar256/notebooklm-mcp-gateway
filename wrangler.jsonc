@@ -11,9 +11,10 @@
     { "binding": "NOTEBOOKLM_SESSION_KV", "id": "__NOTEBOOKLM_SESSION_KV_ID__" }
   ],
   "triggers": {
-    // Keep-alive ping every 3 hours so Google cookie rotations accumulate in
-    // the KV session jar even while MCP clients are idle.
-    "crons": ["15 */3 * * *"]
+    // Keep-alive ping every 30 minutes so Google cookie rotations accumulate in
+    // the KV session jar even while MCP clients are idle — rotated session
+    // cookies can expire within hours, so a sparse cadence can miss them.
+    "crons": ["*/30 * * * *"]
   },
   "vars": {
     "OAUTH_ISSUER": "https://notebooklm-mcp-gateway.xyofn8h7t.workers.dev",
