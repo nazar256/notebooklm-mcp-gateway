@@ -1,8 +1,8 @@
 import type { NotebookLMCredentialEnvelope } from "./authArtifact";
-import { formatCookieDiff, parseCookieHeader } from "./authArtifact";
+import { parseCookieHeader } from "./authArtifact";
 import type { Env } from "./config";
 import { decryptEnvelope, encryptedEnvelopeSchema, encryptEnvelope, type EncryptedEnvelope } from "./crypto";
-import { NotebookLMClient, type RefreshPingResult } from "./notebooklm";
+import { NotebookLMClient } from "./notebooklm";
 
 // Per-connector session store in Workers KV. Values are the same AES-GCM
 // envelope shape the OAuth tokens carry, so cookies are never stored in
@@ -88,8 +88,8 @@ function mergeCookieHeaders(latest: string, seed: string, stored: string): strin
   return [...merged.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
 }
 
-// Seeds the store for a freshly connected credential so the cron keep-alive
-// covers it even before the first tool call or refresh exchange.
+// Seeds the store for a freshly connected credential so the shared jar is
+// available even before the first tool call or refresh exchange.
 export async function seedSessionEnvelope(env: Env, envelope: NotebookLMCredentialEnvelope, encrypted: EncryptedEnvelope): Promise<void> {
   const kv = sessionKv(env);
   if (!kv || !envelope.credId) return;
@@ -105,66 +105,4 @@ export async function deleteSession(env: Env, credId: string | undefined): Promi
 
 function sessionTtlSeconds(env: Env): number {
   return Math.max(86_400, env.CONNECTOR_TTL_MAX_DAYS * 86_400);
-}
-
-// Cron keep-alive: replays every stored credential through a read-only ping so
-// Google cookie rotations accumulate while clients are idle. Live credentials
-// are re-persisted with their rotated jar; expired ones are evicted.
-export async function keepAliveSessions(env: Env): Promise<{ kept: number; expired: number; failed: number }> {
-  const kv = sessionKv(env);
-  const counts = { kept: 0, expired: 0, failed: 0 };
-  if (!kv) return counts;
-  let cursor: string | undefined;
-  do {
-    const page = await kv.list({ prefix: KEY_PREFIX, cursor });
-    for (const key of page.keys) {
-      const outcome = await keepAliveOne(env, kv, key.name);
-      counts[outcome.status] += 1;
-      // Message string carries the diagnostics: Cloudflare Observability does
-      // not index structured log arguments.
-      console.log(`NotebookLM session keep-alive cred=${key.name.slice(KEY_PREFIX.length, KEY_PREFIX.length + 8)} outcome=${outcome.status}${outcome.stage ? ` stage=${outcome.stage}` : ""}${outcome.rotation ? ` rotation=${outcome.rotation}` : ""}${outcome.diff ? ` ${outcome.diff}` : ""}`);
-    }
-    cursor = page.list_complete ? undefined : page.cursor || undefined;
-  } while (cursor);
-  console.log(`NotebookLM session keep-alive done kept=${counts.kept} expired=${counts.expired} failed=${counts.failed}`);
-  return counts;
-}
-
-type KeepAliveOutcome = { status: "kept" | "expired" | "failed"; diff?: string; stage?: string; rotation?: string };
-
-function formatRotation(ping: RefreshPingResult): string | undefined {
-  if (!ping.rotation) return undefined;
-  return ping.rotationStatus ? `${ping.rotation}:${ping.rotationStatus}` : ping.rotation;
-}
-
-async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise<KeepAliveOutcome> {
-  const stored = await loadSessionEnvelope(env, keyName.slice(KEY_PREFIX.length));
-  if (!stored) return { status: "failed" };
-  try {
-    const client = new NotebookLMClient({
-      baseUrl: stored.baseUrl,
-      cookieHeader: stored.cookieHeader,
-      sessionId: stored.sessionId,
-      csrfToken: stored.csrfToken,
-      validationRpcId: stored.validationRpcId,
-      validationFReq: stored.validationFReq,
-      fetch: (input, init) => fetch(input, init)
-    });
-    const ping = await client.refreshCookies();
-    if (ping.outcome === "alive") {
-      await persistSessionEnvelope(env, stored, client, stored.cookieHeader);
-      return { status: "kept", diff: formatCookieDiff(stored.cookieHeader, client.getCookieHeader()), rotation: formatRotation(ping) };
-    }
-    if (ping.outcome === "expired") {
-      await kv.delete(keyName);
-      return { status: "expired", rotation: formatRotation(ping) };
-    }
-    // A failed ping still holds a valid RotateCookies mint when one was
-    // issued: persist only that delta — the full jar may carry poisoned
-    // captures from the rejected exchange.
-    if (ping.rotation === "rotated") await persistSessionMint(env, stored, client).catch(() => undefined);
-    return { status: "failed", stage: ping.stage, rotation: formatRotation(ping) };
-  } catch {
-    return { status: "failed" };
-  }
 }

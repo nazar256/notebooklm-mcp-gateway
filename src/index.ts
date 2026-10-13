@@ -2,7 +2,6 @@ import { parseEnv, type Env } from "./config";
 import { AuthArtifactError } from "./authArtifact";
 import { authenticateMcp, authorizeGet, authorizePost, mcpChallenge, metadata, protectedResourceMetadata, register, token } from "./oauth";
 import { handleMcpRequest } from "./mcp";
-import { keepAliveSessions } from "./sessionStore";
 import { RequestBodyTooLargeError } from "./http";
 
 export default {
@@ -40,16 +39,6 @@ export default {
       return sanitizedError(error);
     }
   },
-
-  async scheduled(_controller: ScheduledController, rawEnv: unknown, ctx: ExecutionContext): Promise<void> {
-    let env: Env;
-    try {
-      env = parseEnv(rawEnv);
-    } catch {
-      return;
-    }
-    ctx.waitUntil(keepAliveSessions(env).catch((error) => console.warn(`NotebookLM keep-alive run failed error=${error instanceof Error ? error.name : "unknown"}`)));
-  }
 };
 
 function sanitizedError(error: unknown): Response {
