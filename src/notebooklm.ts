@@ -12,7 +12,8 @@ export type GenerationStatus = { taskId: string; status: string; artifactId: str
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
 export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
-export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage };
+export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult };
+export type RotateCookiesResult = "rotated" | "skipped" | "failed" | "expired";
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
@@ -67,6 +68,9 @@ const artifactTypeCodeByName: Record<string, number> = { audio: 1, report: 2, br
 // Last-resort boq build label; the live value is read from the bootstrap HTML (cfb2h).
 const fallbackBuildLabel = "boq_labs-tailwind-frontend_20260108.06_p0";
 
+// Google's dedicated cookie-rotation endpoint — the one Chrome itself calls.
+const ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies";
+
 export class NotebookLMClient {
   private baseUrl: (typeof allowedNotebookLMBaseUrls)[number];
   private readonly cookieHeader: string;
@@ -108,8 +112,10 @@ export class NotebookLMClient {
   async refreshCookies(): Promise<RefreshPingResult> {
     const seeded = new Map(this.cookieJar);
     try {
+      const rotation = await this.rotateCookies();
+      if (rotation === "expired") return { outcome: "expired", stage: "auth_expired", rotation };
       await this.validateAuthentication();
-      return { outcome: "alive" };
+      return { outcome: "alive", rotation };
     } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
@@ -119,6 +125,35 @@ export class NotebookLMClient {
         stage: error instanceof NotebookLMError ? error.stage : undefined
       };
     }
+  }
+
+  // Chrome's own session-rotation endpoint (the same POST Chrome runs in the
+  // background): the only surface that mints fresh __Secure-*PSIDTS values.
+  // NotebookLM app traffic never rotates PSIDTS, so without this poke the
+  // freshness partner dies within hours and every batchexecute call degrades
+  // to null wrb.fr frames (upstream_null). A 200 also proves the SID family is
+  // still good: PSIDTS is re-mintable from it even after it fully lapses, so a
+  // session that looks dead to RPC pings may still recover here.
+  // Port of notebooklm-py's keepalive contract (POST [000,"-...0"], 60s-class
+  // cadence), minus their master-token minting paths we don't have.
+  async rotateCookies(): Promise<RotateCookiesResult> {
+    // Google rejects RotateCookies when the jar sends no PSIDTS at all; nothing
+    // else in the flow can re-mint it, so there is no point POSTing empty-handed.
+    const hasPsidts = [...this.cookieJar.keys()].some((name) => name.endsWith("PSIDTS"));
+    if (!hasPsidts) return "skipped";
+    const response = await this.upstreamFetch(ROTATE_COOKIES_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "cookie": this.getCookieHeader(),
+        "origin": "https://accounts.google.com"
+      },
+      body: '[000,"-0000000000000000000"]'
+    });
+    if (!response.ok) return "failed";
+    const body = await response.text();
+    if (isLoginUrl(response.url) || looksLikeGoogleLogin(body)) return "expired";
+    return "rotated";
   }
 
   async validateAuthentication(): Promise<void> {

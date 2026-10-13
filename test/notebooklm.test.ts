@@ -527,6 +527,78 @@ describe("NotebookLMClient", () => {
     expect(client.getCookieHeader()).not.toContain("from-failed-rpc");
   });
 
+  it("rotateCookies mints fresh PSIDTS from the RotateCookies endpoint", async () => {
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    const calls: string[] = [];
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async (input) => {
+        calls.push(String(input));
+        return new Response('[["identity.hfcr",600]]', { headers: rotateHeaders });
+      }
+    });
+
+    await expect(client.rotateCookies()).resolves.toBe("rotated");
+    expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
+    expect(calls[0]).toBe("https://accounts.google.com/RotateCookies");
+  });
+
+  it("rotateCookies skips when the jar has no PSIDTS to rotate", async () => {
+    let called = false;
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test",
+      fetch: async () => {
+        called = true;
+        return new Response("");
+      }
+    });
+
+    await expect(client.rotateCookies()).resolves.toBe("skipped");
+    expect(called).toBe(false);
+  });
+
+  it("rotateCookies reports failed on a non-200 response", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async () => new Response("", { status: 500 })
+    });
+
+    await expect(client.rotateCookies()).resolves.toBe("failed");
+  });
+
+  it("refreshCookies mints PSIDTS via RotateCookies before validating", async () => {
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url === "https://accounts.google.com/RotateCookies") return new Response('[["identity.hfcr",600]]', { headers: rotateHeaders });
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const rpc = decodeNotebookLMRpcRequest(typeof init?.body === "string" ? init.body : "");
+        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]));
+      }
+    });
+
+    await expect(client.refreshCookies()).resolves.toMatchObject({ outcome: "alive", rotation: "rotated" });
+    expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
+  });
+
+  it("reports auth_expired when RotateCookies lands on a sign-in page", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async () => new Response('<html><form action="https://accounts.google.com/ServiceLogin"></form></html>')
+    });
+
+    await expect(client.rotateCookies()).resolves.toBe("expired");
+  });
+
   it("reports auth_expired when bootstrap redirects to Google sign-in instead of using stale copied values", async () => {
     const calls: Array<{ url: string }> = [];
     const client = new NotebookLMClient({
