@@ -116,7 +116,7 @@ export class NotebookLMClient {
       // A failed poke (network blip, accounts.google.com outage) must not veto
       // the ping: the session may still be good, and validateAuthentication
       // decides that below. Only a login-shaped reply is terminal.
-      const poke = await this.rotateCookies().catch(() => ({ result: "failed" as const }));
+      const poke = await this.rotateCookies().catch((): RotateCookiesOutcome => ({ result: "failed" }));
       if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status };
       await this.validateAuthentication();
       return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status };
