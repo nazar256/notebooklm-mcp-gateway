@@ -12,9 +12,9 @@ export type GenerationStatus = { taskId: string; status: string; artifactId: str
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
 export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
-export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult; rotationStatus?: number };
+export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult; rotationStatus?: number; rotationDetail?: string };
 export type RotateCookiesResult = "rotated" | "unchanged" | "skipped" | "failed" | "expired";
-export type RotateCookiesOutcome = { result: RotateCookiesResult; status?: number };
+export type RotateCookiesOutcome = { result: RotateCookiesResult; status?: number; detail?: string };
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
@@ -81,6 +81,14 @@ export class NotebookLMClient {
   private readonly validationRpcId?: string;
   private readonly validationFReq?: string;
   private readonly cookieJar: Map<string, string>;
+  // Cookies minted by the last successful rotateCookies poke. RotateCookies
+  // invalidates the values it replaces, so the mint must survive even when the
+  // rest of the exchange fails — otherwise the persisted jar keeps values
+  // Google already killed and the session is bricked. rotationDeleted tracks
+  // names the poke removed (expired Set-Cookie): without it a seed restore
+  // would resurrect values Google deleted.
+  private rotationMint = new Map<string, string>();
+  private rotationDeleted = new Set<string>();
 
   constructor(options: { baseUrl: string; cookieHeader: string; fetch: typeof fetch; sessionId?: string; csrfToken?: string; validationRpcId?: string; validationFReq?: string }) {
     const baseUrl = z.enum(allowedNotebookLMBaseUrls).parse(options.baseUrl);
@@ -118,18 +126,21 @@ export class NotebookLMClient {
       // the ping: the session may still be good, and validateAuthentication
       // decides that below. Only a login-shaped reply is terminal.
       poke = await this.rotateCookies().catch((): RotateCookiesOutcome => ({ result: "failed" }));
-      if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status };
+      if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status, rotationDetail: poke.detail };
       await this.validateAuthentication();
-      return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status };
+      return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status, rotationDetail: poke.detail };
     } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
+      for (const [name, value] of this.rotationMint) this.cookieJar.set(name, value);
+      for (const name of this.rotationDeleted) this.cookieJar.delete(name);
       const expired = error instanceof NotebookLMError && error.stage === "auth_expired";
       return {
         outcome: expired ? "expired" : "failed",
         stage: error instanceof NotebookLMError ? error.stage : undefined,
         rotation: poke?.result,
-        rotationStatus: poke?.status
+        rotationStatus: poke?.status,
+        rotationDetail: poke?.detail
       };
     }
   }
@@ -151,6 +162,7 @@ export class NotebookLMClient {
     // Snapshot before the fetch: upstreamFetch captures Set-Cookie into the jar
     // inline, so a post-fetch snapshot would already contain the rotation.
     const jarBefore = this.getCookieHeader();
+    const jarBeforeMap = new Map(this.cookieJar);
     const response = await this.upstreamFetch(ROTATE_COOKIES_URL, {
       method: "POST",
       headers: {
@@ -160,15 +172,38 @@ export class NotebookLMClient {
       },
       body: '[000,"-0000000000000000000"]'
     });
-    if (!response.ok) return { result: "failed", status: response.status };
+    if (!response.ok) {
+      // A 401 can mean either ordinary credential rejection or a DBSC
+      // challenge (Sec-Session-Google-Challenge header — Google demanding a
+      // signed device-bound rotation our stateless worker cannot produce).
+      // The distinction decides the fix, so record which one Google sent.
+      const detail = response.headers.get("sec-session-google-challenge") ? "dbsc_challenge" : "rejected";
+      console.warn(`NotebookLM RotateCookies failed status=${response.status} detail=${detail}`);
+      return { result: "failed", status: response.status, detail };
+    }
     const body = await response.text();
     // Do NOT use isLoginUrl here: every RotateCookies response lives on
     // accounts.google.com, which isLoginUrl treats as sign-in (upstreamFetch
     // also skips jar capture for it). Only a real login path or a login-shaped
     // body means the session is dead.
     if (isLoginRedirectPath(response.url) || looksLikeGoogleLogin(body)) return { result: "expired", status: response.status };
+    this.rotationMint.clear();
+    this.rotationDeleted.clear();
     this.captureSetCookies(response.headers);
+    for (const [name, value] of this.cookieJar) if (jarBeforeMap.get(name) !== value) this.rotationMint.set(name, value);
+    for (const name of jarBeforeMap.keys()) if (!this.cookieJar.has(name)) this.rotationDeleted.add(name);
     return { result: this.getCookieHeader() === jarBefore ? "unchanged" : "rotated", status: response.status };
+  }
+
+  // Apply only the RotateCookies changes on top of a base jar: minted values
+  // are set, poke-deleted names removed, every other entry left exactly as the
+  // base has it. Unlike a jar snapshot this can never resurrect names a
+  // concurrent call deleted from the store.
+  applyRotationMint(baseHeader: string): string {
+    const cookies = parseCookieHeader(baseHeader);
+    for (const name of this.rotationDeleted) cookies.delete(name);
+    for (const [name, value] of this.rotationMint) cookies.set(name, value);
+    return [...cookies.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
   }
 
   async validateAuthentication(): Promise<void> {
@@ -866,14 +901,19 @@ export function parseNotebookLMResponse(responseText: string): unknown[] {
 function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull?: boolean } = {}): unknown {
   let result: unknown;
   let sawNullPayload = false;
+  let nullStatus: number | undefined;
   for (const chunk of chunks) {
     if (!Array.isArray(chunk)) continue;
     const items = Array.isArray(chunk[0]) ? chunk : [chunk];
     for (const item of items) {
       if (!Array.isArray(item) || item[0] !== "wrb.fr" || item[1] !== rpcId) continue;
       if (item[2] === null) {
-        if (options.allowNull && result === undefined) result = null;
-        else sawNullPayload = true;
+        // Index 5 of a null-result frame can carry a google.rpc.Status array
+        // ([code, message, details...]); gRPC 16 = UNAUTHENTICATED — the server
+        // is telling us the session itself is rejected, not just this call.
+        const status = Array.isArray(item[5]) ? item[5][0] : undefined;
+        if (typeof status === "number" && Number.isInteger(status)) nullStatus = status;
+        sawNullPayload = true;
         continue;
       }
       if (typeof item[2] === "string" && item[2]) result = JSON.parse(item[2]);
@@ -882,7 +922,20 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
   if (result === undefined) {
     // A well-formed response whose RPC frame carries a null payload is batchexecute's
     // typical answer for a rejected/stale session or CSRF token.
-    if (sawNullPayload) throw new NotebookLMError("NotebookLM returned an empty result", "upstream_null");
+    if (sawNullPayload) {
+      // UNAUTHENTICATED can never tag a genuinely empty result, so it is raised
+      // even for allowNull callers — reporting it as success hides a dead session.
+      if (nullStatus === 16) throw new NotebookLMError("NotebookLM session rejected by upstream", "auth_expired");
+      if (options.allowNull) {
+        // Other status-tagged nulls are recorded on successful flows upstream,
+        // so they still decode as empty — just not silently.
+        if (nullStatus !== undefined && nullStatus !== 0) {
+          console.debug(`NotebookLM RPC ${rpcId}: null result carried wrb status ${nullStatus}; treated as empty result`);
+        }
+        return null;
+      }
+      throw new NotebookLMError(`NotebookLM returned an empty result${nullStatus !== undefined ? ` (wrb status ${nullStatus})` : ""}`, "upstream_null");
+    }
     throw new Error("NotebookLM response did not include expected RPC result");
   }
   return result;

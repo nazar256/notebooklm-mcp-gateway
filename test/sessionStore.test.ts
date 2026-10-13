@@ -5,7 +5,7 @@ import { parseEnv } from "../src/config";
 import { decryptEnvelope } from "../src/crypto";
 import { buildNotebookLMRpcResponse, NotebookLMClient } from "../src/notebooklm";
 import { authenticateMcp } from "../src/oauth";
-import { keepAliveSessions, loadSessionEnvelope, persistSessionEnvelope, sessionKey } from "../src/sessionStore";
+import { loadSessionEnvelope, persistSessionEnvelope, persistSessionMint, sessionKey } from "../src/sessionStore";
 import { env, fakeCtx, fakeKv, fetchWorker, issueAccessToken, sampleCookie } from "./helpers";
 
 const bootstrapHtml = `<!doctype html><script>{"SNlM0e":"csrf","FdrFJe":"sid"}</script>`;
@@ -46,7 +46,62 @@ describe("session store", () => {
     expect(raw).not.toContain("sid-test-value");
   });
 
-  it("token exchange seeds the session store for keep-alive coverage", async () => {
+  it("persistSessionMint writes nothing when nothing was minted", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    const client = jarClient(envelope.baseUrl, envelope.cookieHeader);
+
+    await persistSessionMint(testEnv, envelope, client);
+    expect(await loadSessionEnvelope(testEnv, envelope.credId)).toBeNull();
+  });
+
+  it("persistSessionMint does not overwrite a jar it failed to read", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    await kv.put(sessionKey(envelope.credId!), "not-an-envelope");
+
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=minted-ts; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: envelope.baseUrl,
+      cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=old-ts`,
+      fetch: async () => new Response('[["identity.hfcr",600]]', { headers: rotateHeaders })
+    });
+    await client.rotateCookies();
+
+    await persistSessionMint(testEnv, envelope, client);
+    expect(await kv.get(sessionKey(envelope.credId!))).toBe("not-an-envelope");
+  });
+
+  it("persistSessionMint applies the mint delta onto the stored jar without resurrecting it", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    // Stored jar already moved on: it rotated SIDCC and dropped PSIDTS.
+    const storedClient = jarClient(envelope.baseUrl, "SID=stored-sid; SIDCC=stored-new");
+    await persistSessionEnvelope(testEnv, envelope, storedClient);
+
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=minted-ts; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: envelope.baseUrl,
+      cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=old-ts`,
+      fetch: async () => new Response('[["identity.hfcr",600]]', { headers: rotateHeaders })
+    });
+    await client.rotateCookies();
+
+    await persistSessionMint(testEnv, envelope, client);
+    const stored = await loadSessionEnvelope(testEnv, envelope.credId);
+    expect(stored?.cookieHeader).toContain("SID=stored-sid");
+    expect(stored?.cookieHeader).toContain("SIDCC=stored-new");
+    expect(stored?.cookieHeader).toContain("__Secure-1PSIDTS=minted-ts");
+    expect(stored?.cookieHeader).not.toContain("sid-test-value");
+  });
+
+  it("token exchange seeds the session store", async () => {
+
     const kv = fakeKv();
     const accessToken = await issueAccessToken("notebooklm:read", envWithKv(kv));
     const claims = decodeJwt(accessToken) as { credential: Parameters<typeof decryptEnvelope>[0] };
@@ -111,63 +166,6 @@ describe("session store", () => {
 
     const auth = await authenticateMcp(new Request("http://localhost:8787/mcp", { headers: { authorization: `Bearer ${accessToken}` } }), testEnv);
     expect(auth?.envelope.cookieHeader).toContain("__Secure-1PSIDTS=kv-freshest");
-  });
-
-  it("keep-alive refreshes live credentials and persists their rotation", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, envelope.cookieHeader));
-
-    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/")) {
-        const headers = new Headers();
-        headers.append("set-cookie", "__Secure-1PSIDTS=cron-rotated; Path=/");
-        return new Response(bootstrapHtml, { headers });
-      }
-      return new Response(buildNotebookLMRpcResponse("wXbhsf", [[["nb-1", "Notebook 1"]]]));
-    });
-    try {
-      const counts = await keepAliveSessions(testEnv);
-      expect(counts).toEqual({ kept: 1, expired: 0, failed: 0 });
-      const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
-      expect(loaded?.cookieHeader).toContain("__Secure-1PSIDTS=cron-rotated");
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it("keep-alive evicts credentials whose session Google rejects", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, envelope.cookieHeader));
-
-    vi.stubGlobal("fetch", async () => new Response('<html><form action="https://accounts.google.com/ServiceLogin"></form></html>'));
-    try {
-      const counts = await keepAliveSessions(testEnv);
-      expect(counts).toEqual({ kept: 0, expired: 1, failed: 0 });
-      expect(await kv.get(sessionKey(envelope.credId!))).toBeNull();
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it("keep-alive keeps credentials on transient upstream failures", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, envelope.cookieHeader));
-
-    vi.stubGlobal("fetch", async () => { throw new Error("network down"); });
-    try {
-      const counts = await keepAliveSessions(testEnv);
-      expect(counts).toEqual({ kept: 0, expired: 0, failed: 1 });
-      expect(await kv.get(sessionKey(envelope.credId!))).not.toBeNull();
-    } finally {
-      vi.unstubAllGlobals();
-    }
   });
 
   it("a successful tool call persists jar rotations into KV", async () => {

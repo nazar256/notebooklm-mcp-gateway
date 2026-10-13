@@ -5,7 +5,7 @@ import type { Env } from "./config";
 import type { NotebookLMCredentialEnvelope } from "./authArtifact";
 import { readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
-import { deleteSession, persistSessionEnvelope } from "./sessionStore";
+import { deleteSession, persistSessionEnvelope, persistSessionMint } from "./sessionStore";
 import { hasRequiredScopes, requiredScopesForTool, type NotebookLMScope } from "./scopes";
 
 const MCP_JSON_MAX_BYTES = 1_000_000;
@@ -122,13 +122,27 @@ async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown
   // dies within hours otherwise. Best-effort — a failed poke must not block the
   // call; the RPC's own outcome decides.
   await client.rotateCookies().catch(() => undefined);
-  const payload = await def.run(client, args);
-  // Persist the rotated cookie jar so the next call — from this client, another
-  // client, or the cron keep-alive — does not start from the stale token snapshot.
-  const persist = persistSessionEnvelope(env, envelope, client).catch((error) =>
-    console.warn(`NotebookLM session persist failed cred=${(envelope.credId ?? "-").slice(0, 8)} error=${error instanceof Error ? error.name : "unknown"}`));
-  if (ctx) ctx.waitUntil(persist); else await persist;
-  return payload;
+  try {
+    const payload = await def.run(client, args);
+    // Persist the rotated cookie jar so the next call — from this client or
+    // another — does not start from the stale token snapshot.
+    const persist = persistSessionEnvelope(env, envelope, client).catch((error) =>
+      console.warn(`NotebookLM session persist failed cred=${(envelope.credId ?? "-").slice(0, 8)} error=${error instanceof Error ? error.name : "unknown"}`));
+    if (ctx) ctx.waitUntil(persist); else await persist;
+    return payload;
+  } catch (error) {
+    // A failed call can still carry a valid RotateCookies mint — the only jar
+    // content safe to keep. Everything else from a rejected exchange is
+    // discarded; losing the mint would brick the session (RotateCookies already
+    // invalidated the values it replaced). Skipped on auth_expired: the session
+    // is dead, its mint worthless, and the entry is being evicted anyway.
+    const dead = error instanceof NotebookLMError && error.stage === "auth_expired";
+    if (!dead) {
+      const persist = persistSessionMint(env, envelope, client).catch(() => undefined);
+      if (ctx) ctx.waitUntil(persist); else await persist;
+    }
+    throw error;
+  }
 }
 
 function isInitializeRequest(body: unknown): boolean {

@@ -570,6 +570,22 @@ describe("NotebookLMClient", () => {
     await expect(client.rotateCookies()).resolves.toMatchObject({ result: "failed", status: 500 });
   });
 
+  it("rotateCookies flags a DBSC challenge separately from a plain rejection", async () => {
+    const challenged = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async () => new Response("", { status: 401, headers: { "Sec-Session-Google-Challenge": "chreq" } })
+    });
+    const rejected = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async () => new Response("", { status: 401 })
+    });
+
+    await expect(challenged.rotateCookies()).resolves.toMatchObject({ result: "failed", status: 401, detail: "dbsc_challenge" });
+    await expect(rejected.rotateCookies()).resolves.toMatchObject({ result: "failed", status: 401, detail: "rejected" });
+  });
+
   it("refreshCookies mints PSIDTS via RotateCookies before validating", async () => {
     const rotateHeaders = new Headers();
     rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
@@ -587,6 +603,66 @@ describe("NotebookLMClient", () => {
 
     await expect(client.refreshCookies()).resolves.toMatchObject({ outcome: "alive", rotation: "rotated" });
     expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
+  });
+
+  it("refreshCookies keeps the RotateCookies mint when validation then fails", async () => {
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    // The poke can also delete cookies (expired Set-Cookie) — a seed restore
+    // must not resurrect them.
+    rotateHeaders.append("set-cookie", "__Secure-3PSIDTS=; Path=/; Max-Age=0");
+    const rpcHeaders = new Headers();
+    rpcHeaders.append("set-cookie", "SIDCC=bad-sidcc; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts; __Secure-3PSIDTS=old-3ts",
+      fetch: async (input) => {
+        const url = String(input);
+        if (url === "https://accounts.google.com/RotateCookies") return new Response('[["identity.hfcr",600]]', { headers: rotateHeaders });
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        // Rejected exchange that still plants cookies — those must be discarded.
+        return new Response(")]}'\n[]", { headers: rpcHeaders });
+      }
+    });
+
+    await expect(client.refreshCookies()).resolves.toMatchObject({ outcome: "failed", rotation: "rotated" });
+    // The mint survives the failure restore; cookies from the rejected
+    // exchange, the invalidated pre-mint value and poke-deleted names do not.
+    expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
+    expect(client.getCookieHeader()).not.toContain("stale-ts");
+    expect(client.getCookieHeader()).not.toContain("__Secure-3PSIDTS");
+    expect(client.getCookieHeader()).not.toContain("bad-sidcc");
+  });
+
+  it("applyRotationMint applies only the mint and its deletions onto a base jar", async () => {
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    rotateHeaders.append("set-cookie", "__Secure-3PSIDTS=; Path=/; Max-Age=0");
+    const rpcHeaders = new Headers();
+    rpcHeaders.append("set-cookie", "SIDCC=bad-sidcc; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts; __Secure-3PSIDTS=old-3ts",
+      fetch: async (input) => {
+        const url = String(input);
+        if (url === "https://accounts.google.com/RotateCookies") return new Response('[["identity.hfcr",600]]', { headers: rotateHeaders });
+        return new Response("", { headers: rpcHeaders, status: 500 });
+      }
+    });
+
+    await client.rotateCookies();
+    await client.listNotebooks().catch(() => undefined);
+    expect(client.getCookieHeader()).toContain("bad-sidcc");
+
+    // Applying the mint onto a stored base keeps unrelated entries, sets the
+    // minted value, applies the poke's deletions, and introduces nothing from
+    // the seed or the rejected exchange.
+    const applied = client.applyRotationMint("SID=stored-sid; __Secure-3PSIDTS=stored-3ts");
+    expect(applied).toContain("SID=stored-sid");
+    expect(applied).not.toContain("__Secure-3PSIDTS");
+    expect(applied).toContain("__Secure-1PSIDTS=fresh-ts");
+    expect(applied).not.toContain("stale-ts");
+    expect(applied).not.toContain("bad-sidcc");
   });
 
   it("rotateCookies reports unchanged when a 200 sets no new cookies", async () => {
@@ -683,6 +759,70 @@ describe("NotebookLMClient", () => {
     const error = await client.getNotebook("nb-1").catch((e) => e);
     expect(error).toBeInstanceOf(NotebookLMError);
     expect((error as NotebookLMError).stage).toBe("upstream_null");
+  });
+
+  it("classifies a null payload carrying UNAUTHENTICATED status as auth_expired", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "rLM1Ne", null, null, null, [16], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    const error = await client.getNotebook("nb-1").catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("auth_expired");
+  });
+
+  it("keeps upstream_null for a null payload carrying a non-auth status", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "rLM1Ne", null, null, null, [3], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    const error = await client.getNotebook("nb-1").catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("upstream_null");
+    expect((error as NotebookLMError).message).toContain("wrb status 3");
+  });
+
+  it("classifies an allowNull null payload carrying UNAUTHENTICATED status as auth_expired", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "tGMBJ", null, null, null, [16], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    const error = await client.deleteSource({ notebookId: "nb-1", sourceId: "src-1", confirm: true }).catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("auth_expired");
+  });
+
+  it("keeps allowNull RPCs treating a non-auth status-tagged null as empty success", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "tGMBJ", null, null, null, [3], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    await expect(client.deleteSource({ notebookId: "nb-1", sourceId: "src-1", confirm: true })).resolves.toEqual({ deleted: true, sourceId: "src-1" });
   });
 
   it("keeps allowNull RPCs returning empty success on null payloads", async () => {

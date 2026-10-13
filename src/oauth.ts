@@ -4,7 +4,7 @@ import { AuthArtifactError, formatCookieDiff, parseNotebookLMAuthArtifact } from
 import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt, type EncryptedEnvelope } from "./crypto";
 import { parseUniqueUrlEncoded, readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
-import { loadSessionEnvelope, persistSessionEnvelope, seedSessionEnvelope } from "./sessionStore";
+import { loadSessionEnvelope, persistSessionEnvelope, persistSessionMint, seedSessionEnvelope } from "./sessionStore";
 import { baselineScope, formatScopes, grantScopesFromConsent, notebookLmScopes, parseGrantedScopes, parseRequestedScopes, scopeLabels, type NotebookLMScope } from "./scopes";
 
 const REGISTER_MAX_BYTES = 64_000;
@@ -162,7 +162,7 @@ export async function token(request: Request, env: Env): Promise<Response> {
   if (challenge !== ("code_challenge" in code ? code.code_challenge : code.p)) throw new Error("invalid_grant");
   const credential = resolveAuthCodeCredential(code);
   try {
-    // Seed the session store at connect time so the cron keep-alive covers
+    // Seed the session store at connect time so the shared jar covers
     // this credential even before its first tool call or refresh exchange.
     await seedSessionEnvelope(env, await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64), credential);
   } catch {
@@ -307,11 +307,16 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     // Diff against the ping seed (KV jar when present), not the token snapshot:
     // the token header can be older than KV, which would misattribute earlier
     // rotations to this ping.
-    console.log(`NotebookLM credential refresh ping=${ping.outcome}${ping.stage ? ` stage=${ping.stage}` : ""}${ping.rotation ? ` rotation=${ping.rotation}${ping.rotationStatus ? `:${ping.rotationStatus}` : ""}` : ""} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(seedHeader, cookieHeader)}`);
+    console.log(`NotebookLM credential refresh ping=${ping.outcome}${ping.stage ? ` stage=${ping.stage}` : ""}${ping.rotation ? ` rotation=${ping.rotation}${ping.rotationStatus ? `:${ping.rotationStatus}` : ""}${ping.rotationDetail ? `:${ping.rotationDetail}` : ""}` : ""} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(seedHeader, cookieHeader)}`);
     if (ping.outcome === "alive") {
       // Persist the rotated jar into the shared session store so subsequent
       // calls pick it up without waiting for the next token exchange.
       await persistSessionEnvelope(env, envelope, client, seedHeader);
+    } else if (ping.outcome === "failed" && ping.rotation === "rotated") {
+      // Persist only the RotateCookies mint: it is valid by definition and must
+      // not be dropped (RotateCookies invalidates the values it replaces),
+      // while the rest of the failed exchange's captures may be poisoned.
+      await persistSessionMint(env, envelope, client);
     }
     if (!cookieHeader || cookieHeader === envelope.cookieHeader) return credential;
     return await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
