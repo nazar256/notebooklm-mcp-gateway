@@ -901,12 +901,18 @@ export function parseNotebookLMResponse(responseText: string): unknown[] {
 function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull?: boolean } = {}): unknown {
   let result: unknown;
   let sawNullPayload = false;
+  let nullStatus: number | undefined;
   for (const chunk of chunks) {
     if (!Array.isArray(chunk)) continue;
     const items = Array.isArray(chunk[0]) ? chunk : [chunk];
     for (const item of items) {
       if (!Array.isArray(item) || item[0] !== "wrb.fr" || item[1] !== rpcId) continue;
       if (item[2] === null) {
+        // Index 5 of a null-result frame can carry a google.rpc.Status array
+        // ([code, message, details...]); gRPC 16 = UNAUTHENTICATED — the server
+        // is telling us the session itself is rejected, not just this call.
+        const status = Array.isArray(item[5]) ? item[5][0] : undefined;
+        if (typeof status === "number" && Number.isInteger(status)) nullStatus = status;
         if (options.allowNull && result === undefined) result = null;
         else sawNullPayload = true;
         continue;
@@ -917,7 +923,10 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
   if (result === undefined) {
     // A well-formed response whose RPC frame carries a null payload is batchexecute's
     // typical answer for a rejected/stale session or CSRF token.
-    if (sawNullPayload) throw new NotebookLMError("NotebookLM returned an empty result", "upstream_null");
+    if (sawNullPayload) {
+      if (nullStatus === 16) throw new NotebookLMError("NotebookLM session rejected by upstream", "auth_expired");
+      throw new NotebookLMError(`NotebookLM returned an empty result${nullStatus !== undefined ? ` (wrb status ${nullStatus})` : ""}`, "upstream_null");
+    }
     throw new Error("NotebookLM response did not include expected RPC result");
   }
   return result;

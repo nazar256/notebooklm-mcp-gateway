@@ -761,6 +761,39 @@ describe("NotebookLMClient", () => {
     expect((error as NotebookLMError).stage).toBe("upstream_null");
   });
 
+  it("classifies a null payload carrying UNAUTHENTICATED status as auth_expired", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "rLM1Ne", null, null, null, [16], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    const error = await client.getNotebook("nb-1").catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("auth_expired");
+  });
+
+  it("keeps upstream_null for a null payload carrying a non-auth status", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "rLM1Ne", null, null, null, [3], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    const error = await client.getNotebook("nb-1").catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("upstream_null");
+    expect((error as NotebookLMError).message).toContain("wrb status 3");
+  });
+
   it("keeps allowNull RPCs returning empty success on null payloads", async () => {
     const calls: Array<{ url: string; body?: string }> = [];
     const client = new NotebookLMClient({
