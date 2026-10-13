@@ -112,11 +112,12 @@ export class NotebookLMClient {
   // or half-dead exchange can never poison refreshed tokens.
   async refreshCookies(): Promise<RefreshPingResult> {
     const seeded = new Map(this.cookieJar);
+    let poke: RotateCookiesOutcome | undefined;
     try {
       // A failed poke (network blip, accounts.google.com outage) must not veto
       // the ping: the session may still be good, and validateAuthentication
       // decides that below. Only a login-shaped reply is terminal.
-      const poke = await this.rotateCookies().catch((): RotateCookiesOutcome => ({ result: "failed" }));
+      poke = await this.rotateCookies().catch((): RotateCookiesOutcome => ({ result: "failed" }));
       if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status };
       await this.validateAuthentication();
       return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status };
@@ -126,7 +127,9 @@ export class NotebookLMClient {
       const expired = error instanceof NotebookLMError && error.stage === "auth_expired";
       return {
         outcome: expired ? "expired" : "failed",
-        stage: error instanceof NotebookLMError ? error.stage : undefined
+        stage: error instanceof NotebookLMError ? error.stage : undefined,
+        rotation: poke?.result,
+        rotationStatus: poke?.status
       };
     }
   }
