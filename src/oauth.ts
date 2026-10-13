@@ -162,7 +162,7 @@ export async function token(request: Request, env: Env): Promise<Response> {
   if (challenge !== ("code_challenge" in code ? code.code_challenge : code.p)) throw new Error("invalid_grant");
   const credential = resolveAuthCodeCredential(code);
   try {
-    // Seed the session store at connect time so the cron keep-alive covers
+    // Seed the session store at connect time so the shared jar covers
     // this credential even before its first tool call or refresh exchange.
     await seedSessionEnvelope(env, await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64), credential);
   } catch {

@@ -124,7 +124,7 @@ async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown
   await client.rotateCookies().catch(() => undefined);
   const payload = await def.run(client, args);
   // Persist the rotated cookie jar so the next call — from this client, another
-  // client, or the cron keep-alive — does not start from the stale token snapshot.
+  // client or another — does not start from the stale token snapshot.
   const persist = persistSessionEnvelope(env, envelope, client).catch((error) =>
     console.warn(`NotebookLM session persist failed cred=${(envelope.credId ?? "-").slice(0, 8)} error=${error instanceof Error ? error.name : "unknown"}`));
   if (ctx) ctx.waitUntil(persist); else await persist;
