@@ -81,6 +81,11 @@ export class NotebookLMClient {
   private readonly validationRpcId?: string;
   private readonly validationFReq?: string;
   private readonly cookieJar: Map<string, string>;
+  // Cookies minted by the last successful rotateCookies poke. RotateCookies
+  // invalidates the values it replaces, so the mint must survive even when the
+  // rest of the exchange fails — otherwise the persisted jar keeps values
+  // Google already killed and the session is bricked.
+  private rotationMint = new Map<string, string>();
 
   constructor(options: { baseUrl: string; cookieHeader: string; fetch: typeof fetch; sessionId?: string; csrfToken?: string; validationRpcId?: string; validationFReq?: string }) {
     const baseUrl = z.enum(allowedNotebookLMBaseUrls).parse(options.baseUrl);
@@ -124,6 +129,7 @@ export class NotebookLMClient {
     } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
+      for (const [name, value] of this.rotationMint) this.cookieJar.set(name, value);
       const expired = error instanceof NotebookLMError && error.stage === "auth_expired";
       return {
         outcome: expired ? "expired" : "failed",
@@ -151,6 +157,7 @@ export class NotebookLMClient {
     // Snapshot before the fetch: upstreamFetch captures Set-Cookie into the jar
     // inline, so a post-fetch snapshot would already contain the rotation.
     const jarBefore = this.getCookieHeader();
+    const jarBeforeMap = new Map(this.cookieJar);
     const response = await this.upstreamFetch(ROTATE_COOKIES_URL, {
       method: "POST",
       headers: {
@@ -167,8 +174,21 @@ export class NotebookLMClient {
     // also skips jar capture for it). Only a real login path or a login-shaped
     // body means the session is dead.
     if (isLoginRedirectPath(response.url) || looksLikeGoogleLogin(body)) return { result: "expired", status: response.status };
+    this.rotationMint.clear();
     this.captureSetCookies(response.headers);
+    for (const [name, value] of this.cookieJar) if (jarBeforeMap.get(name) !== value) this.rotationMint.set(name, value);
     return { result: this.getCookieHeader() === jarBefore ? "unchanged" : "rotated", status: response.status };
+  }
+
+  // Reset the jar to the seed plus only the cookies minted by rotateCookies —
+  // the mint is valid by definition, while cookies captured during a failed
+  // exchange may be poisoned and must be discarded. No-op when nothing was
+  // minted: restores exactly the seed.
+  preserveRotationMint(seedHeader: string): void {
+    const seed = parseCookieHeader(seedHeader);
+    this.cookieJar.clear();
+    for (const [name, value] of seed) this.cookieJar.set(name, value);
+    for (const [name, value] of this.rotationMint) this.cookieJar.set(name, value);
   }
 
   async validateAuthentication(): Promise<void> {

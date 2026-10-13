@@ -133,6 +133,9 @@ async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise
       await kv.delete(keyName);
       return { status: "expired", rotation: formatRotation(ping) };
     }
+    // A failed ping still holds a valid RotateCookies mint when one was issued:
+    // persisting it keeps the jar on the minted values Google expects.
+    if (ping.rotation === "rotated") await persistSessionEnvelope(env, stored, client, stored.cookieHeader).catch(() => undefined);
     return { status: "failed", stage: ping.stage, rotation: formatRotation(ping) };
   } catch {
     return { status: "failed" };

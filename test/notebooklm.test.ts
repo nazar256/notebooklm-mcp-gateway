@@ -589,6 +589,56 @@ describe("NotebookLMClient", () => {
     expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
   });
 
+  it("refreshCookies keeps the RotateCookies mint when validation then fails", async () => {
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    const rpcHeaders = new Headers();
+    rpcHeaders.append("set-cookie", "SIDCC=bad-sidcc; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async (input) => {
+        const url = String(input);
+        if (url === "https://accounts.google.com/RotateCookies") return new Response('[["identity.hfcr",600]]', { headers: rotateHeaders });
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        // Rejected exchange that still plants cookies — those must be discarded.
+        return new Response(")]}'\n[]", { headers: rpcHeaders });
+      }
+    });
+
+    await expect(client.refreshCookies()).resolves.toMatchObject({ outcome: "failed", rotation: "rotated" });
+    // The mint survives the failure restore; cookies from the rejected
+    // exchange and the invalidated pre-mint value do not.
+    expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
+    expect(client.getCookieHeader()).not.toContain("stale-ts");
+    expect(client.getCookieHeader()).not.toContain("bad-sidcc");
+  });
+
+  it("preserveRotationMint restores the seed plus only the RotateCookies mint", async () => {
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    const rpcHeaders = new Headers();
+    rpcHeaders.append("set-cookie", "SIDCC=bad-sidcc; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async (input) => {
+        const url = String(input);
+        if (url === "https://accounts.google.com/RotateCookies") return new Response('[["identity.hfcr",600]]', { headers: rotateHeaders });
+        return new Response("", { headers: rpcHeaders, status: 500 });
+      }
+    });
+
+    await client.rotateCookies();
+    await client.listNotebooks().catch(() => undefined);
+    expect(client.getCookieHeader()).toContain("bad-sidcc");
+
+    client.preserveRotationMint("SID=sid-test; __Secure-1PSIDTS=stale-ts");
+    expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
+    expect(client.getCookieHeader()).not.toContain("stale-ts");
+    expect(client.getCookieHeader()).not.toContain("bad-sidcc");
+  });
+
   it("rotateCookies reports unchanged when a 200 sets no new cookies", async () => {
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
