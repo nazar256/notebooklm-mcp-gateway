@@ -55,7 +55,10 @@ export async function persistSessionMint(env: Env, envelope: NotebookLMCredentia
   const stored = await loadSessionEnvelope(env, envelope.credId);
   const base = stored?.cookieHeader ?? envelope.cookieHeader;
   const mergedHeader = client.applyRotationMint(base);
-  if (!mergedHeader || mergedHeader === base) return;
+  // When the store has no entry at all (seeding failed at connect), always
+  // write — otherwise the credential never lands in KV even when nothing was
+  // minted. With an entry, an unchanged header means nothing to persist.
+  if (!mergedHeader || (stored && mergedHeader === base)) return;
   const encrypted = await encryptEnvelope({ ...envelope, cookieHeader: mergedHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
   await kv.put(sessionKey(envelope.credId), JSON.stringify(encrypted), { expirationTtl: sessionTtlSeconds(env) });
 }

@@ -5,7 +5,7 @@ import { parseEnv } from "../src/config";
 import { decryptEnvelope } from "../src/crypto";
 import { buildNotebookLMRpcResponse, NotebookLMClient } from "../src/notebooklm";
 import { authenticateMcp } from "../src/oauth";
-import { keepAliveSessions, loadSessionEnvelope, persistSessionEnvelope, sessionKey } from "../src/sessionStore";
+import { keepAliveSessions, loadSessionEnvelope, persistSessionEnvelope, persistSessionMint, sessionKey } from "../src/sessionStore";
 import { env, fakeCtx, fakeKv, fetchWorker, issueAccessToken, sampleCookie } from "./helpers";
 
 const bootstrapHtml = `<!doctype html><script>{"SNlM0e":"csrf","FdrFJe":"sid"}</script>`;
@@ -44,6 +44,42 @@ describe("session store", () => {
     // Stored blob is the encrypted envelope — plaintext cookies never hit KV.
     const raw = await kv.get(sessionKey(envelope.credId!));
     expect(raw).not.toContain("sid-test-value");
+  });
+
+  it("persistSessionMint still seeds an entry when the store is empty and nothing was minted", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    const client = jarClient(envelope.baseUrl, envelope.cookieHeader);
+
+    await persistSessionMint(testEnv, envelope, client);
+    const stored = await loadSessionEnvelope(testEnv, envelope.credId);
+    expect(stored?.cookieHeader).toContain("SID=sid-test-value");
+  });
+
+  it("persistSessionMint applies the mint delta onto the stored jar without resurrecting it", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    // Stored jar already moved on: it rotated SIDCC and dropped PSIDTS.
+    const storedClient = jarClient(envelope.baseUrl, "SID=stored-sid; SIDCC=stored-new");
+    await persistSessionEnvelope(testEnv, envelope, storedClient);
+
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=minted-ts; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: envelope.baseUrl,
+      cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=old-ts`,
+      fetch: async () => new Response('[["identity.hfcr",600]]', { headers: rotateHeaders })
+    });
+    await client.rotateCookies();
+
+    await persistSessionMint(testEnv, envelope, client);
+    const stored = await loadSessionEnvelope(testEnv, envelope.credId);
+    expect(stored?.cookieHeader).toContain("SID=stored-sid");
+    expect(stored?.cookieHeader).toContain("SIDCC=stored-new");
+    expect(stored?.cookieHeader).toContain("__Secure-1PSIDTS=minted-ts");
+    expect(stored?.cookieHeader).not.toContain("sid-test-value");
   });
 
   it("token exchange seeds the session store for keep-alive coverage", async () => {
