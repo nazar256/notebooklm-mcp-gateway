@@ -794,6 +794,37 @@ describe("NotebookLMClient", () => {
     expect((error as NotebookLMError).message).toContain("wrb status 3");
   });
 
+  it("classifies an allowNull null payload carrying UNAUTHENTICATED status as auth_expired", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "tGMBJ", null, null, null, [16], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    const error = await client.deleteSource({ notebookId: "nb-1", sourceId: "src-1", confirm: true }).catch((e) => e);
+    expect((error as NotebookLMError).stage).toBe("auth_expired");
+  });
+
+  it("keeps allowNull RPCs treating a non-auth status-tagged null as empty success", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader,
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const chunk = JSON.stringify([["wrb.fr", "tGMBJ", null, null, null, [3], "generic"]]);
+        return new Response(`)]}'\n\n${chunk}`);
+      }
+    });
+
+    await expect(client.deleteSource({ notebookId: "nb-1", sourceId: "src-1", confirm: true })).resolves.toEqual({ deleted: true, sourceId: "src-1" });
+  });
+
   it("keeps allowNull RPCs returning empty success on null payloads", async () => {
     const calls: Array<{ url: string; body?: string }> = [];
     const client = new NotebookLMClient({

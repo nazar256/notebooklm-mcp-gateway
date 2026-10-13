@@ -913,8 +913,7 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
         // is telling us the session itself is rejected, not just this call.
         const status = Array.isArray(item[5]) ? item[5][0] : undefined;
         if (typeof status === "number" && Number.isInteger(status)) nullStatus = status;
-        if (options.allowNull && result === undefined) result = null;
-        else sawNullPayload = true;
+        sawNullPayload = true;
         continue;
       }
       if (typeof item[2] === "string" && item[2]) result = JSON.parse(item[2]);
@@ -924,7 +923,17 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
     // A well-formed response whose RPC frame carries a null payload is batchexecute's
     // typical answer for a rejected/stale session or CSRF token.
     if (sawNullPayload) {
+      // UNAUTHENTICATED can never tag a genuinely empty result, so it is raised
+      // even for allowNull callers — reporting it as success hides a dead session.
       if (nullStatus === 16) throw new NotebookLMError("NotebookLM session rejected by upstream", "auth_expired");
+      if (options.allowNull) {
+        // Other status-tagged nulls are recorded on successful flows upstream,
+        // so they still decode as empty — just not silently.
+        if (nullStatus !== undefined && nullStatus !== 0) {
+          console.debug(`NotebookLM RPC ${rpcId}: null result carried wrb status ${nullStatus}; treated as empty result`);
+        }
+        return null;
+      }
       throw new NotebookLMError(`NotebookLM returned an empty result${nullStatus !== undefined ? ` (wrb status ${nullStatus})` : ""}`, "upstream_null");
     }
     throw new Error("NotebookLM response did not include expected RPC result");
