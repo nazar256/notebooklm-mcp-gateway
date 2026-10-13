@@ -12,9 +12,9 @@ export type GenerationStatus = { taskId: string; status: string; artifactId: str
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
 export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
-export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult; rotationStatus?: number };
+export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult; rotationStatus?: number; rotationDetail?: string };
 export type RotateCookiesResult = "rotated" | "unchanged" | "skipped" | "failed" | "expired";
-export type RotateCookiesOutcome = { result: RotateCookiesResult; status?: number };
+export type RotateCookiesOutcome = { result: RotateCookiesResult; status?: number; detail?: string };
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
@@ -126,9 +126,9 @@ export class NotebookLMClient {
       // the ping: the session may still be good, and validateAuthentication
       // decides that below. Only a login-shaped reply is terminal.
       poke = await this.rotateCookies().catch((): RotateCookiesOutcome => ({ result: "failed" }));
-      if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status };
+      if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status, rotationDetail: poke.detail };
       await this.validateAuthentication();
-      return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status };
+      return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status, rotationDetail: poke.detail };
     } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
@@ -139,7 +139,8 @@ export class NotebookLMClient {
         outcome: expired ? "expired" : "failed",
         stage: error instanceof NotebookLMError ? error.stage : undefined,
         rotation: poke?.result,
-        rotationStatus: poke?.status
+        rotationStatus: poke?.status,
+        rotationDetail: poke?.detail
       };
     }
   }
@@ -171,7 +172,15 @@ export class NotebookLMClient {
       },
       body: '[000,"-0000000000000000000"]'
     });
-    if (!response.ok) return { result: "failed", status: response.status };
+    if (!response.ok) {
+      // A 401 can mean either ordinary credential rejection or a DBSC
+      // challenge (Sec-Session-Google-Challenge header — Google demanding a
+      // signed device-bound rotation our stateless worker cannot produce).
+      // The distinction decides the fix, so record which one Google sent.
+      const detail = response.headers.get("sec-session-google-challenge") ? "dbsc_challenge" : "rejected";
+      console.warn(`NotebookLM RotateCookies failed status=${response.status} detail=${detail}`);
+      return { result: "failed", status: response.status, detail };
+    }
     const body = await response.text();
     // Do NOT use isLoginUrl here: every RotateCookies response lives on
     // accounts.google.com, which isLoginUrl treats as sign-in (upstreamFetch

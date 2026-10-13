@@ -570,6 +570,22 @@ describe("NotebookLMClient", () => {
     await expect(client.rotateCookies()).resolves.toMatchObject({ result: "failed", status: 500 });
   });
 
+  it("rotateCookies flags a DBSC challenge separately from a plain rejection", async () => {
+    const challenged = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async () => new Response("", { status: 401, headers: { "Sec-Session-Google-Challenge": "chreq" } })
+    });
+    const rejected = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async () => new Response("", { status: 401 })
+    });
+
+    await expect(challenged.rotateCookies()).resolves.toMatchObject({ result: "failed", status: 401, detail: "dbsc_challenge" });
+    await expect(rejected.rotateCookies()).resolves.toMatchObject({ result: "failed", status: 401, detail: "rejected" });
+  });
+
   it("refreshCookies mints PSIDTS via RotateCookies before validating", async () => {
     const rotateHeaders = new Headers();
     rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
