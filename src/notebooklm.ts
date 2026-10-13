@@ -12,8 +12,9 @@ export type GenerationStatus = { taskId: string; status: string; artifactId: str
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
 export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
-export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult };
+export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult; rotationStatus?: number };
 export type RotateCookiesResult = "rotated" | "unchanged" | "skipped" | "failed" | "expired";
+export type RotateCookiesOutcome = { result: RotateCookiesResult; status?: number };
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
@@ -111,21 +112,24 @@ export class NotebookLMClient {
   // or half-dead exchange can never poison refreshed tokens.
   async refreshCookies(): Promise<RefreshPingResult> {
     const seeded = new Map(this.cookieJar);
+    let poke: RotateCookiesOutcome | undefined;
     try {
       // A failed poke (network blip, accounts.google.com outage) must not veto
       // the ping: the session may still be good, and validateAuthentication
       // decides that below. Only a login-shaped reply is terminal.
-      const rotation = await this.rotateCookies().catch(() => "failed" as const);
-      if (rotation === "expired") return { outcome: "expired", stage: "auth_expired", rotation };
+      poke = await this.rotateCookies().catch((): RotateCookiesOutcome => ({ result: "failed" }));
+      if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status };
       await this.validateAuthentication();
-      return { outcome: "alive", rotation };
+      return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status };
     } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
       const expired = error instanceof NotebookLMError && error.stage === "auth_expired";
       return {
         outcome: expired ? "expired" : "failed",
-        stage: error instanceof NotebookLMError ? error.stage : undefined
+        stage: error instanceof NotebookLMError ? error.stage : undefined,
+        rotation: poke?.result,
+        rotationStatus: poke?.status
       };
     }
   }
@@ -139,11 +143,11 @@ export class NotebookLMClient {
   // session that looks dead to RPC pings may still recover here.
   // Port of notebooklm-py's keepalive contract (POST [000,"-...0"], 60s-class
   // cadence), minus their master-token minting paths we don't have.
-  async rotateCookies(): Promise<RotateCookiesResult> {
+  async rotateCookies(): Promise<RotateCookiesOutcome> {
     // Google rejects RotateCookies when the jar sends no PSIDTS at all; nothing
     // else in the flow can re-mint it, so there is no point POSTing empty-handed.
     const hasPsidts = [...this.cookieJar.keys()].some((name) => name.endsWith("PSIDTS"));
-    if (!hasPsidts) return "skipped";
+    if (!hasPsidts) return { result: "skipped" };
     // Snapshot before the fetch: upstreamFetch captures Set-Cookie into the jar
     // inline, so a post-fetch snapshot would already contain the rotation.
     const jarBefore = this.getCookieHeader();
@@ -156,15 +160,15 @@ export class NotebookLMClient {
       },
       body: '[000,"-0000000000000000000"]'
     });
-    if (!response.ok) return "failed";
+    if (!response.ok) return { result: "failed", status: response.status };
     const body = await response.text();
     // Do NOT use isLoginUrl here: every RotateCookies response lives on
     // accounts.google.com, which isLoginUrl treats as sign-in (upstreamFetch
     // also skips jar capture for it). Only a real login path or a login-shaped
     // body means the session is dead.
-    if (isLoginRedirectPath(response.url) || looksLikeGoogleLogin(body)) return "expired";
+    if (isLoginRedirectPath(response.url) || looksLikeGoogleLogin(body)) return { result: "expired", status: response.status };
     this.captureSetCookies(response.headers);
-    return this.getCookieHeader() === jarBefore ? "unchanged" : "rotated";
+    return { result: this.getCookieHeader() === jarBefore ? "unchanged" : "rotated", status: response.status };
   }
 
   async validateAuthentication(): Promise<void> {
