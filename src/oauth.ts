@@ -307,8 +307,8 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     // Diff against the ping seed (KV jar when present), not the token snapshot:
     // the token header can be older than KV, which would misattribute earlier
     // rotations to this ping.
-    console.log(`NotebookLM credential refresh ping=${ping} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(seedHeader, cookieHeader)}`);
-    if (ping === "alive") {
+    console.log(`NotebookLM credential refresh ping=${ping.outcome}${ping.stage ? ` stage=${ping.stage}` : ""} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(seedHeader, cookieHeader)}`);
+    if (ping.outcome === "alive") {
       // Persist the rotated jar into the shared session store so subsequent
       // calls pick it up without waiting for the next token exchange.
       await persistSessionEnvelope(env, envelope, client, seedHeader);

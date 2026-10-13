@@ -96,7 +96,7 @@ export async function keepAliveSessions(env: Env): Promise<{ kept: number; expir
       counts[outcome.status] += 1;
       // Message string carries the diagnostics: Cloudflare Observability does
       // not index structured log arguments.
-      console.log(`NotebookLM session keep-alive cred=${key.name.slice(KEY_PREFIX.length, KEY_PREFIX.length + 8)} outcome=${outcome.status}${outcome.diff ? ` ${outcome.diff}` : ""}`);
+      console.log(`NotebookLM session keep-alive cred=${key.name.slice(KEY_PREFIX.length, KEY_PREFIX.length + 8)} outcome=${outcome.status}${outcome.stage ? ` stage=${outcome.stage}` : ""}${outcome.diff ? ` ${outcome.diff}` : ""}`);
     }
     cursor = page.list_complete ? undefined : page.cursor || undefined;
   } while (cursor);
@@ -104,7 +104,7 @@ export async function keepAliveSessions(env: Env): Promise<{ kept: number; expir
   return counts;
 }
 
-type KeepAliveOutcome = { status: "kept" | "expired" | "failed"; diff?: string };
+type KeepAliveOutcome = { status: "kept" | "expired" | "failed"; diff?: string; stage?: string };
 
 async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise<KeepAliveOutcome> {
   const stored = await loadSessionEnvelope(env, keyName.slice(KEY_PREFIX.length));
@@ -120,15 +120,15 @@ async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise
       fetch: (input, init) => fetch(input, init)
     });
     const ping = await client.refreshCookies();
-    if (ping === "alive") {
+    if (ping.outcome === "alive") {
       await persistSessionEnvelope(env, stored, client, stored.cookieHeader);
       return { status: "kept", diff: formatCookieDiff(stored.cookieHeader, client.getCookieHeader()) };
     }
-    if (ping === "expired") {
+    if (ping.outcome === "expired") {
       await kv.delete(keyName);
       return { status: "expired" };
     }
-    return { status: "failed" };
+    return { status: "failed", stage: ping.stage };
   } catch {
     return { status: "failed" };
   }

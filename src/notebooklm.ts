@@ -12,6 +12,7 @@ export type GenerationStatus = { taskId: string; status: string; artifactId: str
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
 export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
+export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage };
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
@@ -104,15 +105,19 @@ export class NotebookLMClient {
   // rotations are captured too. The jar is persisted only on a fully successful ping:
   // on any failure it is restored to the seed, so cookies captured during a rejected
   // or half-dead exchange can never poison refreshed tokens.
-  async refreshCookies(): Promise<"alive" | "expired" | "failed"> {
+  async refreshCookies(): Promise<RefreshPingResult> {
     const seeded = new Map(this.cookieJar);
     try {
       await this.validateAuthentication();
-      return "alive";
+      return { outcome: "alive" };
     } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
-      return error instanceof NotebookLMError && error.stage === "auth_expired" ? "expired" : "failed";
+      const expired = error instanceof NotebookLMError && error.stage === "auth_expired";
+      return {
+        outcome: expired ? "expired" : "failed",
+        stage: error instanceof NotebookLMError ? error.stage : undefined
+      };
     }
   }
 
