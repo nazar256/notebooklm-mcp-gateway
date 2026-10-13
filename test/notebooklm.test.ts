@@ -589,6 +589,32 @@ describe("NotebookLMClient", () => {
     expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
   });
 
+  it("rotateCookies reports unchanged when a 200 sets no new cookies", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async () => new Response('[["identity.hfcr",600]]')
+    });
+
+    await expect(client.rotateCookies()).resolves.toBe("unchanged");
+  });
+
+  it("refreshCookies still validates when RotateCookies throws (accounts outage)", async () => {
+    const client = new NotebookLMClient({
+      baseUrl: "https://notebooklm.google.com",
+      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url === "https://accounts.google.com/RotateCookies") throw new Error("network down");
+        if (url.endsWith("/")) return new Response(bootstrapHtml);
+        const rpc = decodeNotebookLMRpcRequest(typeof init?.body === "string" ? init.body : "");
+        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]));
+      }
+    });
+
+    await expect(client.refreshCookies()).resolves.toMatchObject({ outcome: "alive", rotation: "failed" });
+  });
+
   it("reports auth_expired when RotateCookies lands on a sign-in page", async () => {
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
