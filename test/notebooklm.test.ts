@@ -540,7 +540,7 @@ describe("NotebookLMClient", () => {
       }
     });
 
-    await expect(client.rotateCookies()).resolves.toBe("rotated");
+    await expect(client.rotateCookies()).resolves.toMatchObject({ result: "rotated" });
     expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh-ts");
     expect(calls[0]).toBe("https://accounts.google.com/RotateCookies");
   });
@@ -556,7 +556,7 @@ describe("NotebookLMClient", () => {
       }
     });
 
-    await expect(client.rotateCookies()).resolves.toBe("skipped");
+    await expect(client.rotateCookies()).resolves.toMatchObject({ result: "skipped" });
     expect(called).toBe(false);
   });
 
@@ -567,7 +567,7 @@ describe("NotebookLMClient", () => {
       fetch: async () => new Response("", { status: 500 })
     });
 
-    await expect(client.rotateCookies()).resolves.toBe("failed");
+    await expect(client.rotateCookies()).resolves.toMatchObject({ result: "failed", status: 500 });
   });
 
   it("refreshCookies mints PSIDTS via RotateCookies before validating", async () => {
@@ -596,7 +596,7 @@ describe("NotebookLMClient", () => {
       fetch: async () => new Response('[["identity.hfcr",600]]')
     });
 
-    await expect(client.rotateCookies()).resolves.toBe("unchanged");
+    await expect(client.rotateCookies()).resolves.toMatchObject({ result: "unchanged" });
   });
 
   it("refreshCookies still validates when RotateCookies throws (accounts outage)", async () => {
@@ -622,7 +622,7 @@ describe("NotebookLMClient", () => {
       fetch: async () => new Response('<html><form action="https://accounts.google.com/ServiceLogin"></form></html>')
     });
 
-    await expect(client.rotateCookies()).resolves.toBe("expired");
+    await expect(client.rotateCookies()).resolves.toMatchObject({ result: "expired" });
   });
 
   it("reports auth_expired when bootstrap redirects to Google sign-in instead of using stale copied values", async () => {

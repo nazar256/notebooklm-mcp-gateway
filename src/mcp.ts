@@ -121,7 +121,7 @@ async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown
   // __Secure-*PSIDTS freshness partner is minted only by this endpoint and
   // dies within hours otherwise. Best-effort — a failed poke must not block the
   // call; the RPC's own outcome decides.
-  await client.rotateCookies().catch(() => "failed");
+  await client.rotateCookies().catch(() => undefined);
   const payload = await def.run(client, args);
   // Persist the rotated cookie jar so the next call — from this client, another
   // client, or the cron keep-alive — does not start from the stale token snapshot.

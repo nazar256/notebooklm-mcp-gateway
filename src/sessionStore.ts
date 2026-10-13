@@ -2,7 +2,7 @@ import type { NotebookLMCredentialEnvelope } from "./authArtifact";
 import { formatCookieDiff, parseCookieHeader } from "./authArtifact";
 import type { Env } from "./config";
 import { decryptEnvelope, encryptedEnvelopeSchema, encryptEnvelope, type EncryptedEnvelope } from "./crypto";
-import { NotebookLMClient } from "./notebooklm";
+import { NotebookLMClient, type RefreshPingResult } from "./notebooklm";
 
 // Per-connector session store in Workers KV. Values are the same AES-GCM
 // envelope shape the OAuth tokens carry, so cookies are never stored in
@@ -106,6 +106,11 @@ export async function keepAliveSessions(env: Env): Promise<{ kept: number; expir
 
 type KeepAliveOutcome = { status: "kept" | "expired" | "failed"; diff?: string; stage?: string; rotation?: string };
 
+function formatRotation(ping: RefreshPingResult): string | undefined {
+  if (!ping.rotation) return undefined;
+  return ping.rotationStatus ? `${ping.rotation}:${ping.rotationStatus}` : ping.rotation;
+}
+
 async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise<KeepAliveOutcome> {
   const stored = await loadSessionEnvelope(env, keyName.slice(KEY_PREFIX.length));
   if (!stored) return { status: "failed" };
@@ -122,13 +127,13 @@ async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise
     const ping = await client.refreshCookies();
     if (ping.outcome === "alive") {
       await persistSessionEnvelope(env, stored, client, stored.cookieHeader);
-      return { status: "kept", diff: formatCookieDiff(stored.cookieHeader, client.getCookieHeader()), rotation: ping.rotation };
+      return { status: "kept", diff: formatCookieDiff(stored.cookieHeader, client.getCookieHeader()), rotation: formatRotation(ping) };
     }
     if (ping.outcome === "expired") {
       await kv.delete(keyName);
-      return { status: "expired", rotation: ping.rotation };
+      return { status: "expired", rotation: formatRotation(ping) };
     }
-    return { status: "failed", stage: ping.stage, rotation: ping.rotation };
+    return { status: "failed", stage: ping.stage, rotation: formatRotation(ping) };
   } catch {
     return { status: "failed" };
   }
