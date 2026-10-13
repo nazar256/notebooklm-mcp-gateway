@@ -46,15 +46,33 @@ describe("session store", () => {
     expect(raw).not.toContain("sid-test-value");
   });
 
-  it("persistSessionMint still seeds an entry when the store is empty and nothing was minted", async () => {
+  it("persistSessionMint writes nothing when nothing was minted", async () => {
     const kv = fakeKv();
     const testEnv = envWithKv(kv);
     const envelope = parseEnvelope();
     const client = jarClient(envelope.baseUrl, envelope.cookieHeader);
 
     await persistSessionMint(testEnv, envelope, client);
-    const stored = await loadSessionEnvelope(testEnv, envelope.credId);
-    expect(stored?.cookieHeader).toContain("SID=sid-test-value");
+    expect(await loadSessionEnvelope(testEnv, envelope.credId)).toBeNull();
+  });
+
+  it("persistSessionMint does not overwrite a jar it failed to read", async () => {
+    const kv = fakeKv();
+    const testEnv = envWithKv(kv);
+    const envelope = parseEnvelope();
+    await kv.put(sessionKey(envelope.credId!), "not-an-envelope");
+
+    const rotateHeaders = new Headers();
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=minted-ts; Path=/");
+    const client = new NotebookLMClient({
+      baseUrl: envelope.baseUrl,
+      cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=old-ts`,
+      fetch: async () => new Response('[["identity.hfcr",600]]', { headers: rotateHeaders })
+    });
+    await client.rotateCookies();
+
+    await persistSessionMint(testEnv, envelope, client);
+    expect(await kv.get(sessionKey(envelope.credId!))).toBe("not-an-envelope");
   });
 
   it("persistSessionMint applies the mint delta onto the stored jar without resurrecting it", async () => {

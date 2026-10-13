@@ -52,13 +52,21 @@ export async function persistSessionEnvelope(env: Env, envelope: NotebookLMCrede
 export async function persistSessionMint(env: Env, envelope: NotebookLMCredentialEnvelope, client: NotebookLMClient): Promise<void> {
   const kv = sessionKv(env);
   if (!kv || !envelope.credId) return;
-  const stored = await loadSessionEnvelope(env, envelope.credId);
-  const base = stored?.cookieHeader ?? envelope.cookieHeader;
+  // A missing entry is a valid base (the envelope's own snapshot); an
+  // unreadable one is not — writing the older token snapshot over a jar we
+  // failed to read would erase rotations a concurrent call already stored.
+  let storedHeader: string | undefined;
+  const raw = await kv.get(sessionKey(envelope.credId));
+  if (raw !== null) {
+    try {
+      storedHeader = (await decryptEnvelope(encryptedEnvelopeSchema.parse(JSON.parse(raw)), env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64)).cookieHeader;
+    } catch {
+      return;
+    }
+  }
+  const base = storedHeader ?? envelope.cookieHeader;
   const mergedHeader = client.applyRotationMint(base);
-  // When the store has no entry at all (seeding failed at connect), always
-  // write — otherwise the credential never lands in KV even when nothing was
-  // minted. With an entry, an unchanged header means nothing to persist.
-  if (!mergedHeader || (stored && mergedHeader === base)) return;
+  if (!mergedHeader || mergedHeader === base) return;
   const encrypted = await encryptEnvelope({ ...envelope, cookieHeader: mergedHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
   await kv.put(sessionKey(envelope.credId), JSON.stringify(encrypted), { expirationTtl: sessionTtlSeconds(env) });
 }
