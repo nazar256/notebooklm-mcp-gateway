@@ -117,6 +117,11 @@ async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown
   if (def.name === "delete_notebook" && env.MOCK_NOTEBOOKLM_DELETE_JSON) return z.object({ deleted: z.literal(true), notebookId: z.string() }).parse(JSON.parse(env.MOCK_NOTEBOOKLM_DELETE_JSON));
   const safeFetch: typeof fetch = (input, init) => fetch(input, init);
   const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
+  // Same per-invocation RotateCookies poke Chrome runs in the background: the
+  // __Secure-*PSIDTS freshness partner is minted only by this endpoint and
+  // dies within hours otherwise. Best-effort — a failed poke must not block the
+  // call; the RPC's own outcome decides.
+  await client.rotateCookies().catch(() => "failed");
   const payload = await def.run(client, args);
   // Persist the rotated cookie jar so the next call — from this client, another
   // client, or the cron keep-alive — does not start from the stale token snapshot.

@@ -12,6 +12,8 @@ export type GenerationStatus = { taskId: string; status: string; artifactId: str
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
 export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
+export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult };
+export type RotateCookiesResult = "rotated" | "unchanged" | "skipped" | "failed" | "expired";
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
@@ -66,6 +68,9 @@ const artifactTypeCodeByName: Record<string, number> = { audio: 1, report: 2, br
 // Last-resort boq build label; the live value is read from the bootstrap HTML (cfb2h).
 const fallbackBuildLabel = "boq_labs-tailwind-frontend_20260108.06_p0";
 
+// Google's dedicated cookie-rotation endpoint — the one Chrome itself calls.
+const ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies";
+
 export class NotebookLMClient {
   private baseUrl: (typeof allowedNotebookLMBaseUrls)[number];
   private readonly cookieHeader: string;
@@ -104,16 +109,62 @@ export class NotebookLMClient {
   // rotations are captured too. The jar is persisted only on a fully successful ping:
   // on any failure it is restored to the seed, so cookies captured during a rejected
   // or half-dead exchange can never poison refreshed tokens.
-  async refreshCookies(): Promise<"alive" | "expired" | "failed"> {
+  async refreshCookies(): Promise<RefreshPingResult> {
     const seeded = new Map(this.cookieJar);
     try {
+      // A failed poke (network blip, accounts.google.com outage) must not veto
+      // the ping: the session may still be good, and validateAuthentication
+      // decides that below. Only a login-shaped reply is terminal.
+      const rotation = await this.rotateCookies().catch(() => "failed" as const);
+      if (rotation === "expired") return { outcome: "expired", stage: "auth_expired", rotation };
       await this.validateAuthentication();
-      return "alive";
+      return { outcome: "alive", rotation };
     } catch (error) {
       this.cookieJar.clear();
       for (const [name, value] of seeded) this.cookieJar.set(name, value);
-      return error instanceof NotebookLMError && error.stage === "auth_expired" ? "expired" : "failed";
+      const expired = error instanceof NotebookLMError && error.stage === "auth_expired";
+      return {
+        outcome: expired ? "expired" : "failed",
+        stage: error instanceof NotebookLMError ? error.stage : undefined
+      };
     }
+  }
+
+  // Chrome's own session-rotation endpoint (the same POST Chrome runs in the
+  // background): the only surface that mints fresh __Secure-*PSIDTS values.
+  // NotebookLM app traffic never rotates PSIDTS, so without this poke the
+  // freshness partner dies within hours and every batchexecute call degrades
+  // to null wrb.fr frames (upstream_null). A 200 also proves the SID family is
+  // still good: PSIDTS is re-mintable from it even after it fully lapses, so a
+  // session that looks dead to RPC pings may still recover here.
+  // Port of notebooklm-py's keepalive contract (POST [000,"-...0"], 60s-class
+  // cadence), minus their master-token minting paths we don't have.
+  async rotateCookies(): Promise<RotateCookiesResult> {
+    // Google rejects RotateCookies when the jar sends no PSIDTS at all; nothing
+    // else in the flow can re-mint it, so there is no point POSTing empty-handed.
+    const hasPsidts = [...this.cookieJar.keys()].some((name) => name.endsWith("PSIDTS"));
+    if (!hasPsidts) return "skipped";
+    // Snapshot before the fetch: upstreamFetch captures Set-Cookie into the jar
+    // inline, so a post-fetch snapshot would already contain the rotation.
+    const jarBefore = this.getCookieHeader();
+    const response = await this.upstreamFetch(ROTATE_COOKIES_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "cookie": this.getCookieHeader(),
+        "origin": "https://accounts.google.com"
+      },
+      body: '[000,"-0000000000000000000"]'
+    });
+    if (!response.ok) return "failed";
+    const body = await response.text();
+    // Do NOT use isLoginUrl here: every RotateCookies response lives on
+    // accounts.google.com, which isLoginUrl treats as sign-in (upstreamFetch
+    // also skips jar capture for it). Only a real login path or a login-shaped
+    // body means the session is dead.
+    if (isLoginRedirectPath(response.url) || looksLikeGoogleLogin(body)) return "expired";
+    this.captureSetCookies(response.headers);
+    return this.getCookieHeader() === jarBefore ? "unchanged" : "rotated";
   }
 
   async validateAuthentication(): Promise<void> {
@@ -854,6 +905,15 @@ function isExpiredSetCookie(attributes: string[]): boolean {
   }
   if (maxAgeSeen) return false;
   return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function isLoginRedirectPath(responseUrl: string | undefined): boolean {
+  if (!responseUrl) return false;
+  try {
+    return /\/signin|\/ServiceLogin|\/InteractiveLogin/i.test(new URL(responseUrl).pathname);
+  } catch {
+    return false;
+  }
 }
 
 function isLoginUrl(responseUrl: string | undefined): boolean {
