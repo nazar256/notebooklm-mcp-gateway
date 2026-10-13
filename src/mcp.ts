@@ -5,7 +5,7 @@ import type { Env } from "./config";
 import type { NotebookLMCredentialEnvelope } from "./authArtifact";
 import { readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
-import { deleteSession, persistSessionEnvelope } from "./sessionStore";
+import { deleteSession, persistSessionEnvelope, persistSessionMint } from "./sessionStore";
 import { hasRequiredScopes, requiredScopesForTool, type NotebookLMScope } from "./scopes";
 
 const MCP_JSON_MAX_BYTES = 1_000_000;
@@ -138,8 +138,7 @@ async function runWithMocks(env: Env, def: ToolDef, args: Record<string, unknown
     // is dead, its mint worthless, and the entry is being evicted anyway.
     const dead = error instanceof NotebookLMError && error.stage === "auth_expired";
     if (!dead) {
-      client.preserveRotationMint(envelope.cookieHeader);
-      const persist = persistSessionEnvelope(env, envelope, client).catch(() => undefined);
+      const persist = persistSessionMint(env, envelope, client).catch(() => undefined);
       if (ctx) ctx.waitUntil(persist); else await persist;
     }
     throw error;

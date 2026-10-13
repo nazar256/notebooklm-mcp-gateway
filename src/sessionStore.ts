@@ -45,6 +45,21 @@ export async function persistSessionEnvelope(env: Env, envelope: NotebookLMCrede
   await kv.put(sessionKey(envelope.credId), JSON.stringify(encrypted), { expirationTtl: sessionTtlSeconds(env) });
 }
 
+// Persist only the RotateCookies mint (and its deletions) from a call or ping
+// whose exchange failed. The full-jar persist must not run here: a failed
+// exchange can carry poisoned captures, and a synthetic seed+mint jar would
+// resurrect names a concurrent call already deleted from the store.
+export async function persistSessionMint(env: Env, envelope: NotebookLMCredentialEnvelope, client: NotebookLMClient): Promise<void> {
+  const kv = sessionKv(env);
+  if (!kv || !envelope.credId) return;
+  const stored = await loadSessionEnvelope(env, envelope.credId);
+  const base = stored?.cookieHeader ?? envelope.cookieHeader;
+  const mergedHeader = client.applyRotationMint(base);
+  if (!mergedHeader || mergedHeader === base) return;
+  const encrypted = await encryptEnvelope({ ...envelope, cookieHeader: mergedHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+  await kv.put(sessionKey(envelope.credId), JSON.stringify(encrypted), { expirationTtl: sessionTtlSeconds(env) });
+}
+
 function mergeCookieHeaders(latest: string, seed: string, stored: string): string {
   const latestCookies = parseCookieHeader(latest);
   const seedCookies = parseCookieHeader(seed);
@@ -133,9 +148,10 @@ async function keepAliveOne(env: Env, kv: KVNamespace, keyName: string): Promise
       await kv.delete(keyName);
       return { status: "expired", rotation: formatRotation(ping) };
     }
-    // A failed ping still holds a valid RotateCookies mint when one was issued:
-    // persisting it keeps the jar on the minted values Google expects.
-    if (ping.rotation === "rotated") await persistSessionEnvelope(env, stored, client, stored.cookieHeader).catch(() => undefined);
+    // A failed ping still holds a valid RotateCookies mint when one was
+    // issued: persist only that delta — the full jar may carry poisoned
+    // captures from the rejected exchange.
+    if (ping.rotation === "rotated") await persistSessionMint(env, stored, client).catch(() => undefined);
     return { status: "failed", stage: ping.stage, rotation: formatRotation(ping) };
   } catch {
     return { status: "failed" };

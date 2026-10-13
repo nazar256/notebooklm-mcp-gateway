@@ -4,7 +4,7 @@ import { AuthArtifactError, formatCookieDiff, parseNotebookLMAuthArtifact } from
 import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt, type EncryptedEnvelope } from "./crypto";
 import { parseUniqueUrlEncoded, readTextWithLimit } from "./http";
 import { NotebookLMClient, NotebookLMError } from "./notebooklm";
-import { loadSessionEnvelope, persistSessionEnvelope, seedSessionEnvelope } from "./sessionStore";
+import { loadSessionEnvelope, persistSessionEnvelope, persistSessionMint, seedSessionEnvelope } from "./sessionStore";
 import { baselineScope, formatScopes, grantScopesFromConsent, notebookLmScopes, parseGrantedScopes, parseRequestedScopes, scopeLabels, type NotebookLMScope } from "./scopes";
 
 const REGISTER_MAX_BYTES = 64_000;
@@ -308,13 +308,15 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
     // the token header can be older than KV, which would misattribute earlier
     // rotations to this ping.
     console.log(`NotebookLM credential refresh ping=${ping.outcome}${ping.stage ? ` stage=${ping.stage}` : ""}${ping.rotation ? ` rotation=${ping.rotation}${ping.rotationStatus ? `:${ping.rotationStatus}` : ""}` : ""} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(seedHeader, cookieHeader)}`);
-    if (ping.outcome === "alive" || (ping.outcome === "failed" && ping.rotation === "rotated")) {
+    if (ping.outcome === "alive") {
       // Persist the rotated jar into the shared session store so subsequent
-      // calls pick it up without waiting for the next token exchange. On a
-      // failed ping the jar is seed+RotateCookies mint: the mint is valid by
-      // definition and must not be dropped (RotateCookies invalidates the
-      // values it replaces).
+      // calls pick it up without waiting for the next token exchange.
       await persistSessionEnvelope(env, envelope, client, seedHeader);
+    } else if (ping.outcome === "failed" && ping.rotation === "rotated") {
+      // Persist only the RotateCookies mint: it is valid by definition and must
+      // not be dropped (RotateCookies invalidates the values it replaces),
+      // while the rest of the failed exchange's captures may be poisoned.
+      await persistSessionMint(env, envelope, client);
     }
     if (!cookieHeader || cookieHeader === envelope.cookieHeader) return credential;
     return await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
