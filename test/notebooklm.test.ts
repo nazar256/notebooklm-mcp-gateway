@@ -58,27 +58,9 @@ describe("NotebookLMClient", () => {
     expect(calls[1]?.origin).toBe("https://notebook.google.com");
   });
 
-  it("falls back to copied batchexecute bootstrap values when fresh bootstrap cannot be parsed", async () => {
-    const calls: Array<{ url: string; body?: string }> = [];
-    const client = new NotebookLMClient({
-      baseUrl: "https://notebooklm.google.com",
-      cookieHeader,
-      sessionId: "copied-session",
-      csrfToken: "copied-csrf",
-      fetch: async (input, init) => {
-        const url = String(input);
-        const body = typeof init?.body === "string" ? init.body : undefined;
-        calls.push({ url, body });
-        if (url.endsWith("/")) return new Response("signed-in shell without WIZ fields");
-        const rpc = decodeNotebookLMRpcRequest(body ?? "");
-        return new Response(buildNotebookLMRpcResponse(rpc.rpcId, [[notebookRow]]));
-      }
-    });
-
-    await expect(client.listNotebooks()).resolves.toEqual([{ id: "nb-1", title: "Notebook One" }]);
-    expect(calls).toHaveLength(2);
-    expect(calls[1]?.url).toContain("f.sid=copied-session");
-    expect(new URLSearchParams(calls[1]?.body).get("at")).toBe("copied-csrf");
+  it("does not replay stale copied bootstrap tokens after fresh bootstrap fails", async () => {
+    const client = new NotebookLMClient({ baseUrl: "https://notebooklm.google.com", cookieHeader, sessionId: "old", csrfToken: "old", fetch: async () => new Response("tokenless shell") });
+    await expect(client.listNotebooks()).rejects.toMatchObject({ stage: "auth_bootstrap_parse" });
   });
 
   it("validates authentication with the current list-notebooks request shape before replay fallback", async () => {
@@ -249,6 +231,7 @@ describe("NotebookLMClient", () => {
       const url = String(input);
       const body = typeof init?.body === "string" ? init.body : undefined;
       calls.push({ url, body });
+      if (url.endsWith("/")) return new Response(bootstrapHtml);
       if (url.includes("GenerateFreeFormStreamed")) return new Response(buildNotebookLMRpcResponse("chat", ["Answer text", "12345678-1234-1234-1234-123456789abc"]));
       const rpc = decodeNotebookLMRpcRequest(body ?? "");
       const payloads: Record<string, unknown> = {
@@ -389,8 +372,8 @@ describe("NotebookLMClient", () => {
   it("merges rotated Set-Cookie session cookies into subsequent upstream requests", async () => {
     const calls: Array<{ url: string; cookie: string | null }> = [];
     const bootstrapHeaders = new Headers();
-    bootstrapHeaders.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly");
-    bootstrapHeaders.append("set-cookie", "SIDCC=rotated-sidcc; Path=/");
+    bootstrapHeaders.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly; Domain=.google.com");
+    bootstrapHeaders.append("set-cookie", "SIDCC=rotated-sidcc; Path=/; Domain=.google.com");
     bootstrapHeaders.append("set-cookie", "unrelated_tracker=x; Path=/");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
@@ -409,7 +392,7 @@ describe("NotebookLMClient", () => {
     expect(rpcCookie).toContain("SID=sid-test");
     expect(rpcCookie).toContain("__Secure-1PSIDTS=rotated-ts");
     expect(rpcCookie).toContain("SIDCC=rotated-sidcc");
-    expect(rpcCookie).not.toContain("unrelated_tracker");
+    expect(rpcCookie).toContain("unrelated_tracker");
 
     // getCookieHeader exposes the merged snapshot for envelope refresh.
     expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=rotated-ts");
@@ -418,7 +401,7 @@ describe("NotebookLMClient", () => {
 
   it("refreshCookies captures Set-Cookie rotation from an authenticated RPC, not only the shell", async () => {
     const rpcHeaders = new Headers();
-    rpcHeaders.append("set-cookie", "SIDCC=rotated-by-rpc; Path=/");
+    rpcHeaders.append("set-cookie", "SIDCC=rotated-by-rpc; Path=/; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
@@ -438,7 +421,7 @@ describe("NotebookLMClient", () => {
   it("drops cookies deleted upstream via Max-Age=0 instead of persisting the dead value", async () => {
     const calls: Array<{ url: string; cookie: string | null }> = [];
     const bootstrapHeaders = new Headers();
-    bootstrapHeaders.append("set-cookie", "SIDCC=dead-but-nonempty; Max-Age=0; Path=/");
+    bootstrapHeaders.append("set-cookie", "SIDCC=dead-but-nonempty; Max-Age=0; Path=/; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; SIDCC=old-sidcc; 1P_JAR=keep-pasted",
@@ -461,7 +444,7 @@ describe("NotebookLMClient", () => {
 
   it("keeps cookies with positive Max-Age even when Expires is in the past", async () => {
     const bootstrapHeaders = new Headers();
-    bootstrapHeaders.append("set-cookie", "SIDCC=still-valid; Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/");
+    bootstrapHeaders.append("set-cookie", "SIDCC=still-valid; Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
@@ -479,7 +462,7 @@ describe("NotebookLMClient", () => {
 
   it("lets Expires decide when Max-Age is not a valid integer", async () => {
     const bootstrapHeaders = new Headers();
-    bootstrapHeaders.append("set-cookie", "SIDCC=dead-invalid-age; Max-Age=invalid; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/");
+    bootstrapHeaders.append("set-cookie", "SIDCC=dead-invalid-age; Max-Age=invalid; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
@@ -497,7 +480,7 @@ describe("NotebookLMClient", () => {
 
   it("refreshCookies keeps the original jar when the session is expired instead of foreign sign-in cookies", async () => {
     const loginHeaders = new Headers();
-    loginHeaders.append("set-cookie", "SIDCC=foreign-account-sidcc; Path=/");
+    loginHeaders.append("set-cookie", "SIDCC=foreign-account-sidcc; Path=/; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
@@ -511,7 +494,7 @@ describe("NotebookLMClient", () => {
 
   it("refreshCookies discards cookies captured during a failed refresh ping", async () => {
     const rpcHeaders = new Headers();
-    rpcHeaders.append("set-cookie", "SIDCC=from-failed-rpc; Path=/");
+    rpcHeaders.append("set-cookie", "SIDCC=from-failed-rpc; Path=/; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; SIDCC=old-sidcc",
@@ -529,7 +512,7 @@ describe("NotebookLMClient", () => {
 
   it("rotateCookies mints fresh PSIDTS from the RotateCookies endpoint", async () => {
     const rotateHeaders = new Headers();
-    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/; Secure; Domain=.google.com");
     const calls: string[] = [];
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
@@ -588,7 +571,7 @@ describe("NotebookLMClient", () => {
 
   it("refreshCookies mints PSIDTS via RotateCookies before validating", async () => {
     const rotateHeaders = new Headers();
-    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/; Secure; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts",
@@ -607,12 +590,12 @@ describe("NotebookLMClient", () => {
 
   it("refreshCookies keeps the RotateCookies mint when validation then fails", async () => {
     const rotateHeaders = new Headers();
-    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
+    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/; Secure; Domain=.google.com");
     // The poke can also delete cookies (expired Set-Cookie) — a seed restore
     // must not resurrect them.
-    rotateHeaders.append("set-cookie", "__Secure-3PSIDTS=; Path=/; Max-Age=0");
+    rotateHeaders.append("set-cookie", "__Secure-3PSIDTS=; Path=/; Max-Age=0; Secure; Domain=.google.com");
     const rpcHeaders = new Headers();
-    rpcHeaders.append("set-cookie", "SIDCC=bad-sidcc; Path=/");
+    rpcHeaders.append("set-cookie", "SIDCC=bad-sidcc; Path=/; Domain=.google.com");
     const client = new NotebookLMClient({
       baseUrl: "https://notebooklm.google.com",
       cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts; __Secure-3PSIDTS=old-3ts",
@@ -634,35 +617,13 @@ describe("NotebookLMClient", () => {
     expect(client.getCookieHeader()).not.toContain("bad-sidcc");
   });
 
-  it("applyRotationMint applies only the mint and its deletions onto a base jar", async () => {
-    const rotateHeaders = new Headers();
-    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=fresh-ts; Path=/");
-    rotateHeaders.append("set-cookie", "__Secure-3PSIDTS=; Path=/; Max-Age=0");
-    const rpcHeaders = new Headers();
-    rpcHeaders.append("set-cookie", "SIDCC=bad-sidcc; Path=/");
-    const client = new NotebookLMClient({
-      baseUrl: "https://notebooklm.google.com",
-      cookieHeader: "SID=sid-test; __Secure-1PSIDTS=stale-ts; __Secure-3PSIDTS=old-3ts",
-      fetch: async (input) => {
-        const url = String(input);
-        if (url === "https://accounts.google.com/RotateCookies") return new Response('[["identity.hfcr",600]]', { headers: rotateHeaders });
-        return new Response("", { headers: rpcHeaders, status: 500 });
-      }
-    });
-
-    await client.rotateCookies();
-    await client.listNotebooks().catch(() => undefined);
-    expect(client.getCookieHeader()).toContain("bad-sidcc");
-
-    // Applying the mint onto a stored base keeps unrelated entries, sets the
-    // minted value, applies the poke's deletions, and introduces nothing from
-    // the seed or the rejected exchange.
-    const applied = client.applyRotationMint("SID=stored-sid; __Secure-3PSIDTS=stored-3ts");
-    expect(applied).toContain("SID=stored-sid");
-    expect(applied).not.toContain("__Secure-3PSIDTS");
-    expect(applied).toContain("__Secure-1PSIDTS=fresh-ts");
-    expect(applied).not.toContain("stale-ts");
-    expect(applied).not.toContain("bad-sidcc");
+  it("retains the accepted mint and excludes cookies from HTTP failures", async () => {
+    const client = new NotebookLMClient({ baseUrl: "https://notebooklm.google.com", cookieHeader: "SID=s; __Secure-1PSIDTS=old", fetch: async input => String(input).includes("RotateCookies")
+      ? new Response('[["identity.hfcr",600]]', { headers: { "set-cookie": "__Secure-1PSIDTS=fresh; Domain=.google.com; Path=/; Secure" } })
+      : new Response("", { status: 500, headers: { "set-cookie": "SIDCC=untrusted; Domain=.google.com; Path=/" } }) });
+    await client.rotateCookies(); await client.listNotebooks().catch(() => {});
+    expect(client.getCookieHeader()).toContain("__Secure-1PSIDTS=fresh");
+    expect(client.getCookieHeader()).not.toContain("untrusted");
   });
 
   it("rotateCookies reports unchanged when a 200 sets no new cookies", async () => {
@@ -718,7 +679,7 @@ describe("NotebookLMClient", () => {
     expect(error).toBeInstanceOf(NotebookLMError);
     expect((error as NotebookLMError).stage).toBe("auth_expired");
     // No doomed RPC was attempted with stale copied bootstrap values.
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
   });
 
   it("reports auth_expired when bootstrap HTML is a Google login page", async () => {

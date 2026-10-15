@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { authCookieNames, GoogleCookieJar, inferHeaderCookies, importStorageCookies, isCookieDomain, sessionCookieSchema, type SessionCookie } from "./cookies";
 
 export const allowedNotebookLMBaseUrls = [
   "https://notebooklm.google.com",
@@ -11,18 +12,28 @@ export const notebookLMCredentialEnvelopeSchema = z.object({
   source: z.enum(["copy-as-curl", "raw-cookie-header", "notebooklm-py-storage-state"]),
   baseUrl: z.enum(allowedNotebookLMBaseUrls),
   cookieHeader: z.string().min(1),
+  cookieJar: z.array(sessionCookieSchema).max(256).optional(),
+  sessionKey: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  authuser: z.number().int().nonnegative().optional(),
   sessionId: z.string().min(1).optional(),
   csrfToken: z.string().min(1).optional(),
   validationRpcId: z.string().min(1).optional(),
   validationFReq: z.string().min(1).optional(),
   accountEmail: z.string().email().optional(),
-  // Stable per-connector identity used to key the shared session jar in KV.
+  // Stable connector identity; also locates its legacy KV migration entry.
   // Absent on envelopes minted before the KV store existed.
   credId: z.string().min(1).optional(),
   createdAt: z.string().datetime()
 });
 
 export type NotebookLMCredentialEnvelope = z.infer<typeof notebookLMCredentialEnvelopeSchema>;
+
+// Copied RPC bodies may contain notebook content and become arbitrarily large.
+// Only account routing and cookies belong in persistent session credentials.
+export function sessionCredentials(envelope: NotebookLMCredentialEnvelope): NotebookLMCredentialEnvelope {
+  const { sessionId, csrfToken, validationRpcId, validationFReq, ...retained } = envelope;
+  return retained;
+}
 
 export const authArtifactInputSchema = z.string().trim().min(1).max(200_000);
 
@@ -91,7 +102,8 @@ export function safeArtifactReport(envelope: NotebookLMCredentialEnvelope): stri
 }
 
 export function validateObviousNotebookLMCookies(cookieHeader: string): void {
-  if (!cookieHeader.includes("SID=") && !cookieHeader.includes("__Secure-1PSID=")) {
+  const names = parseCookieHeader(cookieHeader);
+  if (!names.has("SID") && !names.has("__Secure-1PSID")) {
     throw new AuthArtifactError("The pasted artifact does not include obvious NotebookLM/Google session cookies.");
   }
 }
@@ -102,20 +114,22 @@ function makeEnvelope(
   cookieHeader: string,
   now: Date,
   accountEmail?: string,
-  bootstrap?: { sessionId?: string; csrfToken?: string; validationRpcId?: string; validationFReq?: string }
+  bootstrap?: { authuser?: number; accountEmail?: string },
+  cookies?: SessionCookie[]
 ): NotebookLMCredentialEnvelope {
-  const normalized = normalizeCookieHeader(cookieHeader);
+  let cookieJar: SessionCookie[];
+  try { cookieJar = cookies ?? inferHeaderCookies(cookieHeader, baseUrl); }
+  catch { throw new AuthArtifactError("The cookie snapshot is ambiguous or too large. Paste a complete browser cookie export instead."); }
+  const normalized = new GoogleCookieJar(cookieJar).flatHeader();
   validateObviousNotebookLMCookies(normalized);
   return notebookLMCredentialEnvelopeSchema.parse({
     format: "notebooklm-mcp-gateway/notebooklm-auth/v1",
     source,
     baseUrl,
     cookieHeader: normalized,
-    sessionId: bootstrap?.sessionId,
-    csrfToken: bootstrap?.csrfToken,
-    validationRpcId: bootstrap?.validationRpcId,
-    validationFReq: bootstrap?.validationFReq,
-    accountEmail,
+    cookieJar,
+    authuser: bootstrap?.authuser,
+    accountEmail: accountEmail ?? bootstrap?.accountEmail,
     credId: crypto.randomUUID(),
     createdAt: now.toISOString()
   });
@@ -192,33 +206,17 @@ function extractCookieFromCurl(input: string): string | null {
   return null;
 }
 
-function extractBootstrapFromCurl(input: string): { sessionId?: string; csrfToken?: string; validationRpcId?: string; validationFReq?: string } {
-  const sessionId = extractQueryParam(input, "f.sid");
-  const csrfToken = extractFormParamFromCurl(input, "at");
-  const validationRpcId = extractQueryParam(input, "rpcids");
-  const validationFReq = extractFormParamFromCurl(input, "f.req");
-  return { sessionId, csrfToken, validationRpcId, validationFReq };
+function extractBootstrapFromCurl(input: string): { authuser?: number; accountEmail?: string } {
+  const route = extractQueryParam(input, "authuser") ?? extractCurlHeaderValue(input, "x-goog-authuser");
+  const authuser = route !== undefined && /^\d+$/.test(route) ? Number(route) : undefined;
+  const email = z.string().email().safeParse(route);
+  return { authuser, accountEmail: email.success ? email.data : undefined };
 }
 
 function extractQueryParam(input: string, name: string): string | undefined {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = new RegExp(`[?&]${escaped}=([^&'"\\s]+)`).exec(input);
   return match?.[1] ? decodeURIComponent(match[1].replace(/\\u0026/g, "&")) : undefined;
-}
-
-function extractFormParamFromCurl(input: string, name: string): string | undefined {
-  const patterns = [
-    /(?:^|\s)--data(?:-raw|-binary)?\s+'([^']+)'/i,
-    /(?:^|\s)--data(?:-raw|-binary)?\s+"([^"]+)"/i,
-    /(?:^|\s)-d\s+'([^']+)'/i,
-    /(?:^|\s)-d\s+"([^"]+)"/i
-  ];
-  for (const pattern of patterns) {
-    const body = pattern.exec(input)?.[1];
-    const value = body ? new URLSearchParams(body).get(name) : null;
-    if (value) return value;
-  }
-  return undefined;
 }
 
 function extractRawCookieHeader(input: string): string | null {
@@ -240,60 +238,22 @@ function tryParseStorageState(input: string, now: Date): NotebookLMCredentialEnv
   }
   const state = storageStateSchema.safeParse(parsed);
   if (!state.success) return null;
-  const relevantCookies = state.data.cookies.filter((cookie) => {
-    const domain = cookie.domain ?? "";
-    return domain.includes("google.com") || domain.includes("notebooklm") || cookie.name.includes("SID");
-  });
-  const cookieHeader = relevantCookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+  const relevantCookies = state.data.cookies.filter((cookie) => isCookieDomain(cookie.domain ?? "google.com"));
   const baseUrl = relevantCookies.some((cookie) => cookieDomainHost(cookie.domain) === "notebooklm.cloud.google.com")
     ? "https://notebooklm.cloud.google.com"
     : relevantCookies.some((cookie) => cookieDomainHost(cookie.domain) === "notebook.google.com")
-      ? "https://notebook.google.com"
-      : "https://notebooklm.google.com";
-  return makeEnvelope(
-    "notebooklm-py-storage-state",
-    baseUrl,
-    cookieHeader,
-    now,
-    state.data.notebooklm?.account?.email
-  );
+      ? "https://notebook.google.com" : "https://notebooklm.google.com";
+  const cookies = importStorageCookies(relevantCookies, baseUrl);
+  return makeEnvelope("notebooklm-py-storage-state", baseUrl, "", now,
+    state.data.notebooklm?.account?.email,
+    { authuser: state.data.notebooklm?.account?.authuser }, cookies);
 }
 
 function cookieDomainHost(domain: string | undefined): string {
   return (domain ?? "").replace(/^\./, "").toLowerCase();
 }
 
-function normalizeCookieHeader(cookieHeader: string): string {
-  const normalized = cookieHeader
-    .replace(/^cookie\s*:\s*/i, "")
-    .replace(/\\\n/g, " ")
-    .replace(/[\r\n]+/g, " ")
-    .replace(/\s*;\s*/g, "; ")
-    .trim();
-  return compactCookieHeader(normalized);
-}
-
-export const notebookLmCookieAllowlist = new Set([
-  "SID",
-  "__Secure-1PSID",
-  "__Secure-3PSID",
-  "HSID",
-  "SSID",
-  "APISID",
-  "SAPISID",
-  "__Secure-1PAPISID",
-  "__Secure-3PAPISID",
-  "OSID",
-  "__Secure-OSID",
-  "NID",
-  "SIDCC",
-  "__Secure-1PSIDCC",
-  "__Secure-3PSIDCC",
-  "__Secure-1PSIDTS",
-  "__Secure-3PSIDTS",
-  "__Secure-1PSIDRTS",
-  "__Secure-3PSIDRTS"
-]);
+export const notebookLmCookieAllowlist = authCookieNames;
 
 export function parseCookieHeader(cookieHeader: string): Map<string, string> {
   const cookies = new Map<string, string>();
@@ -336,18 +296,4 @@ function formatCookieNames(names: string[]): string {
   const other = names.length - known.length;
   const suffix = other > 0 ? `${known.length > 0 ? "," : ""}+${other} unrecognized` : "";
   return `[${known.join(",")}${suffix}]`;
-}
-
-function compactCookieHeader(cookieHeader: string): string {
-  const cookies = new Map<string, string>();
-  for (const part of cookieHeader.split(";")) {
-    const trimmed = part.trim();
-    const separator = trimmed.indexOf("=");
-    if (separator <= 0) continue;
-    const name = trimmed.slice(0, separator).trim();
-    const value = trimmed.slice(separator + 1).trim();
-    if (!notebookLmCookieAllowlist.has(name)) continue;
-    cookies.set(name, value);
-  }
-  return [...cookies.entries()].map(([name, value]) => `${name}=${value}`).join("; ") || cookieHeader;
 }

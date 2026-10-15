@@ -50,6 +50,7 @@ export function hasRequiredScopes(granted: readonly NotebookLMScope[], required:
 }
 
 export const toolScopeRequirements: Record<string, readonly NotebookLMScope[]> = {
+  get_auth_status: ["notebooklm:read"],
   list_notebooks: ["notebooklm:read"],
   get_notebook: ["notebooklm:read"],
   list_sources: ["notebooklm:read"],

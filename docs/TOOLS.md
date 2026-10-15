@@ -8,6 +8,7 @@ The gateway intentionally does not return raw upstream NotebookLM response blobs
 
 | Tool | Scope | Category | Safety |
 | --- | --- | --- | --- |
+| `get_auth_status` | `notebooklm:read` | authentication | safe state/counters; no Google call |
 | `list_notebooks` | `notebooklm:read` | notebooks | read-only |
 | `get_notebook` | `notebooklm:read` | notebooks | read-only |
 | `create_notebook` | `notebooklm:write` | notebooks | writes NotebookLM state |

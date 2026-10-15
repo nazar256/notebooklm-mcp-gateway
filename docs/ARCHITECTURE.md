@@ -9,30 +9,47 @@ The gateway is a Cloudflare Worker that exposes:
 - OAuth Authorization Code + PKCE;
 - a bearer-protected Streamable HTTP MCP endpoint at `/mcp`.
 
-The Worker is stateless. It creates a request-local MCP server/transport for every authenticated MCP request and does not depend on KV, Durable Objects, D1, R2, cache, or filesystem storage.
+OAuth and MCP are served by the TypeScript Worker. Each Google session has a
+SQLite-backed `NotebookLMSession` Durable Object. No external server, Docker,
+Python runtime, browser, or CLI is required in the deployment.
 
 ## Authentication flow
 
-1. The MCP client discovers OAuth metadata from the Worker.
-2. The client dynamically registers a public OAuth client.
-3. The user opens `/authorize` and pastes a fresh NotebookLM Copy-as-cURL artifact from a live `batchexecute` request.
-4. The Worker parses and minimally validates the artifact against NotebookLM.
-5. The Worker encrypts a compact NotebookLM credential envelope and returns a signed authorization code.
-6. The client exchanges the code with PKCE for a short-lived MCP access token and a stateless refresh token.
-7. MCP tool calls decrypt the envelope from the access token and call NotebookLM's browser endpoints.
+1. The MCP client discovers metadata and registers its redirect URI.
+2. The user grants scopes and pastes Copy-as-cURL (or a browser storage export).
+3. The Worker parses cookies/account routing and obtains a keyed session owner ID.
+4. The owner serializes import, best-effort rotation, fresh bootstrap, and a known
+   read-only authentication probe, then awaits encrypted persistence.
+5. The actual updated envelope is encrypted into the signed auth code.
+6. PKCE exchange issues access/refresh tokens with the original grant's scopes.
+7. Tool calls and OAuth refresh load authoritative owner state, rotate when due,
+   perform bounded recovery, and save accepted changes before returning.
+8. `get_auth_status` reads safe diagnostics without a Google request.
 
-The current OAuth grant is coarse-grained: once connected, the client can request any MCP tool exposed by this Worker. Tool-level safety is enforced with input schemas and explicit confirmations for destructive or sharing-changing operations, not with per-tool OAuth scopes.
+The owner ID is derived from a domain-separated HMAC of the Google session's
+SID-family identity. Copies imported through different connectors coordinate
+with one owner; separate Google logins on one account remain separate.
+Account routing is grant-specific and is not replaced by another connector's
+selected account when loading shared cookie state.
 
-## Stateless tradeoffs
+## State and compatibility
 
-Keeping auth artifacts inside signed JWTs avoids server-side credential persistence, but it means:
+The owner queue spans network awaits as well as storage reads/writes. Durable
+Objects alone do not serialize asynchronous operations automatically. KV's
+read-merge-write behavior is no longer used for active sessions.
 
-- auth codes cannot be marked as used;
-- refresh-token replay cannot be detected;
-- revocation is limited to secret rotation or upstream Google/NotebookLM session invalidation;
-- callback URLs must stay compact enough for real OAuth clients.
+Pre-port tokens remain accepted. An uninitialized owner reads the legacy
+`cred:<credId>` KV entry once, if available, then becomes authoritative. A failed
+read/decrypt never silently downgrades to an older token snapshot. The legacy KV
+binding must remain during migration; new production operations do not write it.
 
-The implementation deliberately compacts large OAuth-bound values and returns a small HTML success page after authorization so browser clients do not depend on very long `303 Location` redirects.
+OAuth codes and refresh tokens remain self-contained and replayable until JWT
+expiry. This work changes Google-session ownership, not OAuth revocation.
+Google errors retain the jar and diagnosis rather than evicting it. An inactivity
+alarm eventually removes expired session storage.
+
+See [AUTHENTICATION.md](AUTHENTICATION.md) for source mapping, scope inference,
+recovery rules, metrics and the boundary of cURL-based authentication.
 
 ## NotebookLM API boundary
 

@@ -1,224 +1,183 @@
-import { decodeJwt } from "jose";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseNotebookLMAuthArtifact } from "../src/authArtifact";
 import { parseEnv } from "../src/config";
-import { decryptEnvelope } from "../src/crypto";
-import { buildNotebookLMRpcResponse, NotebookLMClient } from "../src/notebooklm";
-import { authenticateMcp } from "../src/oauth";
-import { loadSessionEnvelope, persistSessionEnvelope, persistSessionMint, sessionKey } from "../src/sessionStore";
-import { env, fakeCtx, fakeKv, fetchWorker, issueAccessToken, sampleCookie } from "./helpers";
+import { decryptEnvelope, encryptEnvelope } from "../src/crypto";
+import { buildNotebookLMRpcResponse } from "../src/notebooklm";
+import { SessionCoordinator, identifySession, runSessionOperation, sessionKey, type SessionPersistence, type StoredSession } from "../src/sessionStore";
+import { env, fakeKv } from "./helpers";
 
-const bootstrapHtml = `<!doctype html><script>{"SNlM0e":"csrf","FdrFJe":"sid"}</script>`;
-const liveFetch: typeof fetch = (input, init) => fetch(input, init);
-
-function parseEnvelope() {
-  return parseNotebookLMAuthArtifact(`curl 'https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute' -H 'cookie: ${sampleCookie}'`);
+const testEnv = () => parseEnv(Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("MOCK_"))));
+const artifact = () => parseNotebookLMAuthArtifact("SID=synthetic; __Secure-1PSIDTS=seed; OSID=binding");
+const html = '<script>{"SNlM0e":"csrf","FdrFJe":"session"}</script>';
+function storage() {
+  let record: StoredSession | undefined;
+  const store: SessionPersistence = { get: async <T>() => structuredClone(record) as T | undefined, put: async (_key, value) => { record = structuredClone(value); }, deleteAll: async () => { record = undefined; } };
+  return { store, record: () => record };
 }
-
-function envWithKv(kv: KVNamespace, dropMocks = false) {
-  const raw = dropMocks ? Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("MOCK_"))) : env;
-  return parseEnv({ ...raw, NOTEBOOKLM_SESSION_KV: kv });
+function upstream(rotate = "fresh") {
+  return async (input: RequestInfo | URL) => String(input).includes("RotateCookies")
+    ? new Response('[["identity.hfcr",600]]', { headers: { "set-cookie": `__Secure-1PSIDTS=${rotate}; Domain=.google.com; Path=/; Secure; HttpOnly` } })
+    : new Response(String(input).includes("batchexecute") ? buildNotebookLMRpcResponse("wXbhsf", [[]]) : html);
 }
+afterEach(() => vi.unstubAllGlobals());
 
-function jarClient(baseUrl: string, cookieHeader: string) {
-  return new NotebookLMClient({ baseUrl, cookieHeader, fetch: liveFetch });
-}
-
-describe("session store", () => {
-  it("assigns a stable credId to parsed artifacts", () => {
-    const envelope = parseEnvelope();
-    expect(envelope.credId).toMatch(/^[0-9a-f-]{36}$/);
+describe("serialized Google session owner", () => {
+  it("coordinates copies of one SID and isolates separate Google sessions", async () => {
+    expect(await identifySession(testEnv(), artifact())).toBe(await identifySession(testEnv(), artifact()));
+    expect(await identifySession(testEnv(), artifact())).not.toBe(await identifySession(testEnv(), parseNotebookLMAuthArtifact("SID=another; OSID=b")));
   });
-
-  it("round-trips the rotated jar through encrypted KV entries", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    const client = jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=rotated`);
-
-    await persistSessionEnvelope(testEnv, envelope, client);
-    const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
-
-    expect(loaded?.cookieHeader).toContain("SIDCC=rotated");
-    expect(loaded?.cookieHeader).toContain("SID=sid-test-value");
-    // Stored blob is the encrypted envelope — plaintext cookies never hit KV.
-    const raw = await kv.get(sessionKey(envelope.credId!));
-    expect(raw).not.toContain("sid-test-value");
+  it("persists rotated cookies encrypted before returning connect success", async () => {
+    const s = storage(); vi.stubGlobal("fetch", upstream());
+    const result = await new SessionCoordinator(s.store, testEnv(), "durable-object").run(artifact(), { kind: "connect" });
+    expect(result.ok).toBe(true);
+    expect(result.envelope.cookieHeader).toContain("fresh");
+    expect(JSON.stringify(s.record())).not.toContain("SID=synthetic");
+    expect((await decryptEnvelope(s.record()!.encrypted, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64)).cookieHeader).toContain("fresh");
   });
-
-  it("persistSessionMint writes nothing when nothing was minted", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    const client = jarClient(envelope.baseUrl, envelope.cookieHeader);
-
-    await persistSessionMint(testEnv, envelope, client);
-    expect(await loadSessionEnvelope(testEnv, envelope.credId)).toBeNull();
-  });
-
-  it("persistSessionMint does not overwrite a jar it failed to read", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    await kv.put(sessionKey(envelope.credId!), "not-an-envelope");
-
-    const rotateHeaders = new Headers();
-    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=minted-ts; Path=/");
-    const client = new NotebookLMClient({
-      baseUrl: envelope.baseUrl,
-      cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=old-ts`,
-      fetch: async () => new Response('[["identity.hfcr",600]]', { headers: rotateHeaders })
+  it("loads the saved jar after owner recreation instead of regressing to the token", async () => {
+    const s = storage(); const seed = artifact(); vi.stubGlobal("fetch", upstream());
+    await new SessionCoordinator(s.store, testEnv(), "durable-object").run(seed, { kind: "connect" });
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(new Headers(init?.headers).get("cookie") ?? ""); return upstream()(input);
     });
-    await client.rotateCookies();
-
-    await persistSessionMint(testEnv, envelope, client);
-    expect(await kv.get(sessionKey(envelope.credId!))).toBe("not-an-envelope");
+    const result = await new SessionCoordinator(s.store, testEnv(), "durable-object").run(seed, { kind: "refresh" });
+    expect(result.ok).toBe(true); expect(seen[0]).toContain("__Secure-1PSIDTS=fresh");
+    expect(s.record()?.counters.rotation_attempts).toBe(1);
   });
-
-  it("persistSessionMint applies the mint delta onto the stored jar without resurrecting it", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    // Stored jar already moved on: it rotated SIDCC and dropped PSIDTS.
-    const storedClient = jarClient(envelope.baseUrl, "SID=stored-sid; SIDCC=stored-new");
-    await persistSessionEnvelope(testEnv, envelope, storedClient);
-
-    const rotateHeaders = new Headers();
-    rotateHeaders.append("set-cookie", "__Secure-1PSIDTS=minted-ts; Path=/");
-    const client = new NotebookLMClient({
-      baseUrl: envelope.baseUrl,
-      cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=old-ts`,
-      fetch: async () => new Response('[["identity.hfcr",600]]', { headers: rotateHeaders })
-    });
-    await client.rotateCookies();
-
-    await persistSessionMint(testEnv, envelope, client);
-    const stored = await loadSessionEnvelope(testEnv, envelope.credId);
-    expect(stored?.cookieHeader).toContain("SID=stored-sid");
-    expect(stored?.cookieHeader).toContain("SIDCC=stored-new");
-    expect(stored?.cookieHeader).toContain("__Secure-1PSIDTS=minted-ts");
-    expect(stored?.cookieHeader).not.toContain("sid-test-value");
-  });
-
-  it("token exchange seeds the session store", async () => {
-
-    const kv = fakeKv();
-    const accessToken = await issueAccessToken("notebooklm:read", envWithKv(kv));
-    const claims = decodeJwt(accessToken) as { credential: Parameters<typeof decryptEnvelope>[0] };
-    const tokenEnvelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
-    const stored = await loadSessionEnvelope(envWithKv(kv), tokenEnvelope.credId);
-    expect(stored?.cookieHeader).toContain("SID=sid-test-value");
-  });
-
-  it("persist lets a call's own rotations win over the stored jar", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=seeded`));
-    // The call seeded with SIDCC=seeded and rotated it mid-request.
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=call-rotated`), `${sampleCookie}; SIDCC=seeded`);
-    const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
-    expect(loaded?.cookieHeader).toContain("SIDCC=call-rotated");
-  });
-
-  it("persist unions with a concurrently written jar instead of overwriting it", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    // A faster call already persisted its newer rotation.
-    const kvHeader = `${sampleCookie}; SIDCC=kv-newer`;
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, kvHeader));
-    // A slower call seeded from that same jar did not touch SIDCC but rotated OTCSR.
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=kv-newer; OTCSR=call-rotated`), kvHeader);
-    const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
-    expect(loaded?.cookieHeader).toContain("SIDCC=kv-newer");
-    expect(loaded?.cookieHeader).toContain("OTCSR=call-rotated");
-  });
-
-  it("persist applies deletions the call observed to the stored jar", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const envelope = parseEnvelope();
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, `${sampleCookie}; SIDCC=seeded`));
-    // The call deleted SIDCC mid-request (e.g. an expired Set-Cookie).
-    await persistSessionEnvelope(testEnv, envelope, jarClient(envelope.baseUrl, sampleCookie), `${sampleCookie}; SIDCC=seeded`);
-    const loaded = await loadSessionEnvelope(testEnv, envelope.credId);
-    expect(loaded?.cookieHeader).not.toContain("SIDCC");
-  });
-
-  it("returns null for unknown or missing credentials", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    expect(await loadSessionEnvelope(testEnv, "missing-cred")).toBeNull();
-    expect(await loadSessionEnvelope(testEnv, undefined)).toBeNull();
-  });
-
-  it("authenticateMcp prefers the KV jar over the token snapshot", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv);
-    const accessToken = await issueAccessToken("notebooklm:read");
-    const claims = decodeJwt(accessToken) as { credential: Parameters<typeof decryptEnvelope>[0] };
-    const tokenEnvelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
-    expect(tokenEnvelope.credId).toBeTruthy();
-
-    const client = jarClient(tokenEnvelope.baseUrl, `${sampleCookie}; __Secure-1PSIDTS=kv-freshest`);
-    await persistSessionEnvelope(testEnv, tokenEnvelope, client);
-
-    const auth = await authenticateMcp(new Request("http://localhost:8787/mcp", { headers: { authorization: `Bearer ${accessToken}` } }), testEnv);
-    expect(auth?.envelope.cookieHeader).toContain("__Secure-1PSIDTS=kv-freshest");
-  });
-
-  it("a successful tool call persists jar rotations into KV", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv, true);
-    const accessToken = await issueAccessToken("notebooklm:read");
-    const claims = decodeJwt(accessToken) as { credential: Parameters<typeof decryptEnvelope>[0] };
-    const tokenEnvelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
-
+  it("serializes concurrent requests across Google I/O and save", async () => {
+    const s = storage(); const seed = artifact(); const owner = new SessionCoordinator(s.store, testEnv(), "durable-object");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => { firstStarted = resolve; });
+    let rotations = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/")) {
-        const headers = new Headers();
-        headers.append("set-cookie", "SIDCC=call-rotated; Path=/");
-        return new Response(bootstrapHtml, { headers });
-      }
-      return new Response(buildNotebookLMRpcResponse("wXbhsf", [[["nb-1", "Notebook 1"]]]));
+      if (String(input).includes("RotateCookies")) { rotations++; firstStarted(); await gate; }
+      return upstream()(input);
     });
-    try {
-      const response = await fetchWorker("/mcp", {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_notebooks", arguments: {} } })
-      }, testEnv);
-      expect(response.status).toBe(200);
-      const loaded = await loadSessionEnvelope(testEnv, tokenEnvelope.credId);
-      expect(loaded?.cookieHeader).toContain("SIDCC=call-rotated");
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    const first = owner.run(seed, { kind: "connect" }); await started;
+    const second = owner.run(seed, { kind: "refresh" });
+    await Promise.resolve(); expect(rotations).toBe(1);
+    release(); const results = await Promise.all([first, second]);
+    expect(results.every((r) => r.ok)).toBe(true);
+    expect(rotations).toBe(1); expect(s.record()?.version).toBe(2);
   });
-
-  it("an auth_expired tool call evicts the stored session", async () => {
-    const kv = fakeKv();
-    const testEnv = envWithKv(kv, true);
-    const accessToken = await issueAccessToken("notebooklm:read");
-    const claims = decodeJwt(accessToken) as { credential: Parameters<typeof decryptEnvelope>[0] };
-    const tokenEnvelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
-    await persistSessionEnvelope(testEnv, tokenEnvelope, jarClient(tokenEnvelope.baseUrl, tokenEnvelope.cookieHeader));
-
-    vi.stubGlobal("fetch", async () => new Response('<html><form action="https://accounts.google.com/ServiceLogin"></form></html>'));
+  it("keeps a successful mint when subsequent RPC authentication is rejected", async () => {
+    const s = storage(); vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      if (String(input).includes("batchexecute")) return new Response(")]}'\n" + JSON.stringify([["wrb.fr", "wXbhsf", null, null, null, [16], "generic"]]));
+      return upstream()(input);
+    });
+    const result = await new SessionCoordinator(s.store, testEnv(), "durable-object").run(artifact(), { kind: "connect" });
+    expect(result.ok).toBe(false); expect(result.error?.reason).toBe("rpc_unauthenticated");
+    expect(result.envelope.cookieHeader).toContain("fresh"); expect(s.record()).toBeDefined();
+    expect(s.record()?.counters.recovery_attempts).toBe(1);
+  });
+  it("fails closed on unreadable stored state without overwriting it or contacting Google", async () => {
+    const s = storage(); vi.stubGlobal("fetch", upstream());
+    const owner = new SessionCoordinator(s.store, testEnv(), "durable-object");
+    const seed = artifact(); await owner.run(seed, { kind: "connect" });
+    s.record()!.encrypted = { v: 1, iv: "bad", ciphertext: "bad" };
+    const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+    const result = await owner.run(seed, { kind: "refresh" });
+    expect(result.error?.reason).toBe("read_failed"); expect(fetch).not.toHaveBeenCalled();
+    expect(s.record()?.encrypted).toEqual({ v: 1, iv: "bad", ciphertext: "bad" });
+  });
+  it("migrates the legacy KV jar once, then ignores the stale KV snapshot", async () => {
+    const s = storage(); const seed = artifact(); const kv = fakeKv();
+    await kv.put(sessionKey(seed.credId!), JSON.stringify(await encryptEnvelope({ ...seed, cookieJar: undefined, cookieHeader: "SID=synthetic; OSID=b; __Secure-1PSIDTS=legacy-new" }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64)));
+    const e = parseEnv({ ...testEnv(), NOTEBOOKLM_SESSION_KV: kv });
+    const seen: string[] = []; vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => { seen.push(new Headers(init?.headers).get("cookie") ?? ""); return upstream()(input); });
+    const owner = new SessionCoordinator(s.store, e, "durable-object");
+    await owner.run(seed, { kind: "refresh" }); expect(seen[0]).toContain("legacy-new");
+    await kv.put(sessionKey(seed.credId!), "invalid");
+    expect((await owner.run(seed, { kind: "refresh" })).ok).toBe(true);
+  });
+  it("reports storage failure instead of claiming a mutation was safely persisted", async () => {
+    const s = storage(); vi.stubGlobal("fetch", upstream());
+    s.store.put = async () => { throw new Error("disk unavailable"); };
+    const result = await new SessionCoordinator(s.store, testEnv(), "durable-object").run(parseNotebookLMAuthArtifact("SID=synthetic"), { kind: "connect" });
+    expect(result.error?.reason).toBe("persist_failed_after_upstream");
+  });
+  it("checkpoints rotation before the next upstream request", async () => {
+    const s = storage(); const seed = artifact();
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      if (!String(input).includes("RotateCookies")) {
+        expect(s.record()?.lastOutcome).toBe("pending");
+        expect((await decryptEnvelope(s.record()!.encrypted, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64)).cookieHeader).toContain("fresh");
+      }
+      return upstream()(input);
+    });
+    expect((await new SessionCoordinator(s.store, testEnv(), "durable-object").run(seed, { kind: "connect" })).ok).toBe(true);
+  });
+  it("durably claims a rotation attempt before contacting Google", async () => {
+    const s = storage(); const seed = artifact();
+    let atRequest: StoredSession | undefined;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      if (String(input).includes("RotateCookies")) atRequest = s.record();
+      return upstream()(input);
+    });
+    expect((await new SessionCoordinator(s.store, testEnv(), "durable-object").run(seed, { kind: "connect" })).ok).toBe(true);
+    expect(atRequest?.lastReason).toBe("rotation_attempt");
+    expect(atRequest?.lastRotationAttemptAt).toBeGreaterThan(0);
+    expect(atRequest?.counters.rotation_attempts).toBe(1);
+  });
+  it("does not replace the accepted jar after a failed reconnect with an obsolete snapshot", async () => {
+    const s = storage(); const seed = artifact(); const owner = new SessionCoordinator(s.store, testEnv(), "durable-object");
+    vi.stubGlobal("fetch", upstream());
+    expect((await owner.run(seed, { kind: "connect" })).ok).toBe(true);
+    vi.stubGlobal("fetch", async () => new Response("signed out", { status: 401 }));
+    expect((await owner.run(seed, { kind: "connect" })).ok).toBe(false);
+    const saved = await decryptEnvelope(s.record()!.encrypted, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+    expect(saved.cookieHeader).toContain("__Secure-1PSIDTS=fresh");
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => { seen.push(new Headers(init?.headers).get("cookie") ?? ""); return upstream()(input); });
+    expect((await owner.run(seed, { kind: "refresh" })).ok).toBe(true);
+    expect(seen[0]).toContain("__Secure-1PSIDTS=fresh");
+  });
+  it("does not submit a mutation when the rotation checkpoint fails", async () => {
+    const s = storage(); const put = s.store.put; let writes = 0;
+    s.store.put = async (key, value) => { if (++writes > 1) throw new Error("disk unavailable"); await put(key, value); };
+    const fetch = vi.fn(upstream()); vi.stubGlobal("fetch", fetch);
+    const result = await new SessionCoordinator(s.store, testEnv(), "durable-object").run(artifact(), { kind: "tool", tool: "create_notebook", args: { title: "fixture" } });
+    expect(result.error?.reason).toBe("rotation_checkpoint_failed");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String(fetch.mock.calls[0][0])).toContain("RotateCookies");
+  });
+  it("does not contact Google when the durable attempt claim fails", async () => {
+    const s = storage(); s.store.put = async () => { throw new Error("disk unavailable"); };
+    const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+    const result = await new SessionCoordinator(s.store, testEnv(), "durable-object").run(artifact(), { kind: "refresh" });
+    expect(result.error?.reason).toBe("rotation_attempt_failed"); expect(fetch).not.toHaveBeenCalled();
+  });
+  it("retains a received reconnect mint if its first checkpoint fails but the final save succeeds", async () => {
+    const s = storage(); const seed = artifact(); vi.stubGlobal("fetch", upstream());
+    const owner = new SessionCoordinator(s.store, testEnv(), "durable-object");
+    await owner.run(seed, { kind: "connect" });
+    s.record()!.lastRotationAttemptAt = 0;
+    const put = s.store.put; let writes = 0;
+    s.store.put = async (key, value) => { if (++writes === 2) throw new Error("transient write failure"); await put(key, value); };
+    vi.stubGlobal("fetch", upstream("newer"));
+    const result = await owner.run(seed, { kind: "connect" });
+    expect(result.error?.reason).toBe("rotation_checkpoint_failed");
+    expect((await decryptEnvelope(s.record()!.encrypted, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64)).cookieHeader).toContain("__Secure-1PSIDTS=newer");
+  });
+  it("exposes secret-free diagnostics even after Google recovery is exhausted", async () => {
+    const s = storage(); const seed = artifact();
+    vi.stubGlobal("fetch", async () => new Response("", { status: 401, headers: { "Sec-Session-Google-Challenge": "SECRET_CHALLENGE" } }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
-      const ctx = fakeCtx();
-      const response = await fetchWorker("/mcp", {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_notebooks", arguments: {} } })
-      }, testEnv, ctx);
-      await Promise.all(ctx.pending);
-      expect(response.status).toBe(200);
-      expect(await kv.get(sessionKey(tokenEnvelope.credId!))).toBeNull();
-    } finally {
-      vi.unstubAllGlobals();
-    }
+      const owner = new SessionCoordinator(s.store, testEnv(), "durable-object");
+      await owner.run(seed, { kind: "connect" });
+      const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+      const result = await owner.run(seed, { kind: "status" });
+      const diagnostic = JSON.stringify(result.payload);
+      expect(diagnostic).toContain("device_bound_challenge");
+      expect(diagnostic).not.toContain("synthetic"); expect(diagnostic).not.toContain("SECRET_CHALLENGE");
+      expect(JSON.stringify(log.mock.calls)).not.toContain("SECRET_CHALLENGE"); expect(fetch).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
+  it("never substitutes an ephemeral store when the production binding is missing", async () => {
+    await expect(runSessionOperation(parseEnv({ ...testEnv(), SESSION_STORE_MODE: "durable-object" }), artifact(), { kind: "refresh" })).rejects.toMatchObject({ reason: "binding_missing" });
   });
 });

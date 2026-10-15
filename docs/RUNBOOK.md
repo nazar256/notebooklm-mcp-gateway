@@ -110,24 +110,51 @@ npx wrangler deploy
 
 When reporting a bug, include sanitized request shapes, tool names, status codes, trace IDs, and reproduction steps. Do not include cookies, tokens, private notebook data, or raw upstream bodies.
 
-## Troubleshooting tool failures
+## Authentication troubleshooting
 
-Tool errors report a failure stage and trace ID:
+Call `get_auth_status` first. It does not contact Google or expose credentials.
+Inspect `state`, `reason`, `rotation`, `counters`, `inventory`, and last success.
+The token grant can still be valid while Google-session recovery is exhausted.
 
-- `auth_expired` — upstream redirected to Google sign-in, returned an HTML login page, or rejected the session (401/403). Reconnect with a fresh Copy-as-cURL artifact.
-- `upstream_null` — batchexecute returned a well-formed response with a null payload for a required RPC. This is the typical signature of a stale session or stale CSRF token; reconnect if it persists.
-- `upstream_parse` — the response did not contain the expected RPC frame: a likely upstream schema change.
-- `upstream_http` / `auth_bootstrap_http` — non-2xx from NotebookLM (status included).
-- `auth_bootstrap_parse` — the NotebookLM shell page loaded but session fields were missing; markup change or partial session.
-- `runtime` — unexpected connector-side error.
+- `auth_expired`: Google sign-in or explicit UNAUTHENTICATED after bounded recovery.
+- `auth_challenge`: an interactive Google challenge.
+- `access_denied`: HTTP 403, RPC permission denial, or an access gate; not proof of session expiry.
+- `cookie_mismatch`: Google rejected cookie/account context on a bridge.
+- `auth_bootstrap_parse`: missing fresh WIZ fields after the /login probe.
+- `upstream_null`: a required RPC has no result; inspect `rpcStatus` and account route.
+- `upstream_redirect`: a blocked external redirect or exhausted hop budget.
+- `upstream_timeout`: connection/response body exceeded the bounded request deadline.
+- `session_store`: storage/binding failure. An upstream mutation may already have
+  completed; do not blindly retry it.
 
-Rotated session cookies are re-baked into tokens on every refresh-token exchange (see ADR-011), so a connector that is used regularly keeps refreshing itself. If a connector is idle longer than Google's cookie-rotation grace window, reconnect with a fresh artifact.
+## Session owner deployment and migration
 
-Workers Logs are enabled in `wrangler.jsonc`; `console.warn` entries include the tool name, stage, upstream HTTP status, and pasted-cookie age in days. Cookies, tokens, and upstream bodies are never logged.
+`wrangler.jsonc` declares the `NOTEBOOKLM_SESSIONS` binding and the
+`auth-sessions-v1` SQLite Durable Object migration. Normal Wrangler deployment
+applies both. This uses Cloudflare-managed storage, with Workers Free quotas;
+there is no container or external server. `SESSION_STORE_MODE` defaults to
+`durable-object` and production fails closed without its owner binding.
 
-## Session store (KV)
+Keep `NOTEBOOKLM_SESSION_KV` and its existing namespace while old OAuth tokens
+migrate. The existing deploy workflow resolves that namespace as before. New
+operations never write KV. Do not remove the binding or roll back to a KV-only
+build while active sessions have rotated only in Durable Objects.
 
-Connected credentials get a stable `credId` and one KV entry (`cred:<credId>`) in the `NOTEBOOKLM_SESSION_KV` namespace holding the encrypted session envelope. The deploy workflow creates the `notebooklm-mcp-session-kv` namespace via the Cloudflare API if missing — `CLOUDFLARE_API_TOKEN` needs Workers KV Storage edit permission. `wrangler.jsonc` ships a `__NOTEBOOKLM_SESSION_KV_ID__` placeholder the workflow fills at deploy time.
+There is no keep-alive cron. Active tool calls/refresh exchanges rotate lazily,
+with a persisted 60-second attempt guard. This does not guarantee survival of
+an idle, revoked, device-bound, or policy-expired session. The inactivity alarm
+cleans session storage after the configured maximum connector lifetime.
 
-There is no keep-alive cron — sessions are refreshed lazily, the same model the reference `notebooklm` CLI uses: browser-copied sessions stay valid through days of idle without pinging. Every tool call first pokes `https://accounts.google.com/RotateCookies` — the same endpoint Chrome uses in the background — because the short-lived `__Secure-*PSIDTS` freshness partner is minted only there and plain RPC traffic never refreshes it; the refresh-token exchange runs the same ping. Successful exchanges persist the rotated jar back to KV; a failed exchange still keeps the RotateCookies mint (seed+mint only — RotateCookies invalidates the values it replaces); `auth_expired` evicts the entry. Watch `NotebookLM credential refresh` log entries for per-credential `ping`/`stage`/`rotation` values and cookie diffs (cookie names only, never values). Diagnostics are embedded in the log message string itself — Cloudflare Observability does not index structured log arguments, so keep it that way when adding logs.
+Run `npm run check` and `npm run test:runtime` before deployment. The runtime
+check needs a loopback socket and uses no real Google credentials. The unit
+suite's explicit `memory` mode is not a production fallback.
 
+## Logs and evidence
+
+Search Worker/Durable Object log message text for `notebooklm_auth`, then
+correlate the `session` and `traceId` values inside the JSON message. Events cover
+`import`, `rotation`, `http`, `recovery`, `storage`, and `operation`.
+Only fixed route categories, status codes, counts and presence flags are logged;
+there are no raw URLs/query strings, cookie values, challenges or notebook text.
+See [AUTHENTICATION.md](AUTHENTICATION.md) for the diagnostic decision table,
+controlled comparison and idle/concurrency acceptance procedure.

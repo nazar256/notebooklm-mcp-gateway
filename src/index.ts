@@ -51,3 +51,5 @@ function sanitizedError(error: unknown): Response {
   const message = error instanceof Error && error.message === "invalid_grant" ? "invalid_grant" : "invalid_request";
   return new Response(JSON.stringify({ error: message }), { status: 400, headers: { "content-type": "application/json" } });
 }
+
+export { NotebookLMSession } from "./sessionStore";

@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { allowedNotebookLMBaseUrls, notebookLmCookieAllowlist, parseCookieHeader } from "./authArtifact";
+import { allowedNotebookLMBaseUrls } from "./authArtifact";
+import { GoogleCookieJar, cookieIdentity, inferHeaderCookies, type SessionCookie } from "./cookies";
+import { AuthTransportError, GoogleSessionHttp } from "./authHttp";
+import type { AuthObserver } from "./authTelemetry";
 
 export type NotebookSummary = { id: string; title: string };
 export type Notebook = NotebookSummary & { sourcesCount: number; createdAt: string | null; isOwner: boolean };
@@ -11,20 +14,24 @@ export type Artifact = { id: string; title: string; type: string; status: string
 export type GenerationStatus = { taskId: string; status: string; artifactId: string | null };
 export type ResearchTask = { taskId: string; status: string; query: string; sources: Array<{ title: string; url: string; type: string }> };
 export type AskResult = { answer: string; conversationId: string | null; references: Array<{ sourceId: string | null; text: string | null; citationNumber: number | null }> };
-export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse";
+export type NotebookLMFailureStage = "auth_bootstrap_http" | "auth_bootstrap_parse" | "auth_expired" | "upstream_http" | "upstream_null" | "upstream_parse" | "auth_challenge" | "access_denied" | "cookie_mismatch" | "upstream_redirect" | "upstream_timeout" | "session_store";
 export type RefreshPingResult = { outcome: "alive" | "expired" | "failed"; stage?: NotebookLMFailureStage; rotation?: RotateCookiesResult; rotationStatus?: number; rotationDetail?: string };
 export type RotateCookiesResult = "rotated" | "unchanged" | "skipped" | "failed" | "expired";
-export type RotateCookiesOutcome = { result: RotateCookiesResult; status?: number; detail?: string };
+export type RotateCookiesOutcome = { result: RotateCookiesResult; status?: number; detail?: string; psidtsChanged?: boolean };
 
 export class NotebookLMError extends Error {
   readonly stage: NotebookLMFailureStage;
   readonly status?: number;
+  readonly reason: string;
+  readonly rpcStatus?: number;
 
-  constructor(message: string, stage: NotebookLMFailureStage, options: { status?: number; cause?: unknown } = {}) {
+  constructor(message: string, stage: NotebookLMFailureStage, options: { status?: number; cause?: unknown; reason?: string; rpcStatus?: number } = {}) {
     super(message, { cause: options.cause });
     this.name = "NotebookLMError";
     this.stage = stage;
     this.status = options.status;
+    this.reason = options.reason ?? stage;
+    this.rpcStatus = options.rpcStatus;
   }
 }
 
@@ -74,150 +81,80 @@ const ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies";
 
 export class NotebookLMClient {
   private baseUrl: (typeof allowedNotebookLMBaseUrls)[number];
-  private readonly cookieHeader: string;
-  private readonly fetchImpl: typeof fetch;
-  private readonly copiedSessionId?: string;
-  private readonly copiedCsrfToken?: string;
-  private readonly validationRpcId?: string;
-  private readonly validationFReq?: string;
-  private readonly cookieJar: Map<string, string>;
-  // Cookies minted by the last successful rotateCookies poke. RotateCookies
-  // invalidates the values it replaces, so the mint must survive even when the
-  // rest of the exchange fails — otherwise the persisted jar keeps values
-  // Google already killed and the session is bricked. rotationDeleted tracks
-  // names the poke removed (expired Set-Cookie): without it a seed restore
-  // would resurrect values Google deleted.
-  private rotationMint = new Map<string, string>();
-  private rotationDeleted = new Set<string>();
+  private readonly jar: GoogleCookieJar;
+  private readonly http: GoogleSessionHttp;
+  private readonly observe: AuthObserver;
+  private readonly accountEmail?: string;
+  private readonly authuser?: number;
+  private rotationNotBefore: number;
+  private onRotateAttempt?: () => Promise<void>;
+  private onRotation?: () => Promise<void>;
+  private recovered = false;
+  lastRotation?: RotateCookiesOutcome;
 
-  constructor(options: { baseUrl: string; cookieHeader: string; fetch: typeof fetch; sessionId?: string; csrfToken?: string; validationRpcId?: string; validationFReq?: string }) {
-    const baseUrl = z.enum(allowedNotebookLMBaseUrls).parse(options.baseUrl);
-    this.baseUrl = baseUrl;
-    this.cookieHeader = options.cookieHeader;
-    this.fetchImpl = options.fetch;
-    this.copiedSessionId = options.sessionId;
-    this.copiedCsrfToken = options.csrfToken;
-    this.validationRpcId = options.validationRpcId;
-    this.validationFReq = options.validationFReq;
-    this.cookieJar = parseCookieHeader(options.cookieHeader);
+  constructor(options: { baseUrl: string; cookieHeader: string; cookieJar?: SessionCookie[]; fetch: typeof fetch; sessionId?: string; csrfToken?: string; validationRpcId?: string; validationFReq?: string; accountEmail?: string; authuser?: number; observe?: AuthObserver; rotationNotBefore?: number; onRotateAttempt?: () => Promise<void>; onRotation?: () => Promise<void> }) {
+    this.baseUrl = z.enum(allowedNotebookLMBaseUrls).parse(options.baseUrl);
+    this.jar = new GoogleCookieJar(options.cookieJar ?? inferHeaderCookies(options.cookieHeader, this.baseUrl));
+    this.observe = options.observe ?? (() => {});
+    this.http = new GoogleSessionHttp(this.jar, options.fetch, this.observe);
+    this.accountEmail = options.accountEmail;
+    this.authuser = options.authuser;
+    this.rotationNotBefore = options.rotationNotBefore ?? 0;
+    this.onRotateAttempt = options.onRotateAttempt;
+    this.onRotation = options.onRotation;
   }
+  getCookieHeader(): string { return this.jar.flatHeader(); }
+  getCookieJar(): SessionCookie[] { return this.jar.snapshot(); }
+  getBaseUrl(): (typeof allowedNotebookLMBaseUrls)[number] { return this.baseUrl; }
+  getInventory() { return this.jar.inventory(this.baseUrl); }
 
-  // Google rotates session cookies (SIDCC/PSIDCC/PSIDTS families) via Set-Cookie on
-  // nearly every response. Tracking them here keeps the pasted snapshot fresher for
-  // the life of this invocation, and lets callers persist the rotated values. The jar
-  // starts from the pasted header, so non-allowlisted pasted cookies keep being sent;
-  // an emptied jar stays empty rather than resurrecting deleted cookies.
-  getCookieHeader(): string {
-    return [...this.cookieJar.entries()]
-      .map(([name, value]) => `${name}=${value}`)
-      .join("; ");
-  }
-
-  // Best-effort upstream session ping whose only purpose is collecting Set-Cookie
-  // rotation. Runs a real authenticated RPC, not just the shell, so batchexecute-level
-  // rotations are captured too. The jar is persisted only on a fully successful ping:
-  // on any failure it is restored to the seed, so cookies captured during a rejected
-  // or half-dead exchange can never poison refreshed tokens.
   async refreshCookies(): Promise<RefreshPingResult> {
-    const seeded = new Map(this.cookieJar);
-    let poke: RotateCookiesOutcome | undefined;
+    const rotation = await this.rotateCookies();
     try {
-      // A failed poke (network blip, accounts.google.com outage) must not veto
-      // the ping: the session may still be good, and validateAuthentication
-      // decides that below. Only a login-shaped reply is terminal.
-      poke = await this.rotateCookies().catch((): RotateCookiesOutcome => ({ result: "failed" }));
-      if (poke.result === "expired") return { outcome: "expired", stage: "auth_expired", rotation: poke.result, rotationStatus: poke.status, rotationDetail: poke.detail };
       await this.validateAuthentication();
-      return { outcome: "alive", rotation: poke.result, rotationStatus: poke.status, rotationDetail: poke.detail };
+      return { outcome: "alive", rotation: rotation.result, rotationStatus: rotation.status, rotationDetail: rotation.detail };
     } catch (error) {
-      this.cookieJar.clear();
-      for (const [name, value] of seeded) this.cookieJar.set(name, value);
-      for (const [name, value] of this.rotationMint) this.cookieJar.set(name, value);
-      for (const name of this.rotationDeleted) this.cookieJar.delete(name);
-      const expired = error instanceof NotebookLMError && error.stage === "auth_expired";
-      return {
-        outcome: expired ? "expired" : "failed",
-        stage: error instanceof NotebookLMError ? error.stage : undefined,
-        rotation: poke?.result,
-        rotationStatus: poke?.status,
-        rotationDetail: poke?.detail
-      };
+      const failure = error instanceof NotebookLMError ? error : undefined;
+      return { outcome: failure?.stage === "auth_expired" ? "expired" : "failed", stage: failure?.stage, rotation: rotation.result, rotationStatus: rotation.status, rotationDetail: rotation.detail };
     }
   }
-
-  // Chrome's own session-rotation endpoint (the same POST Chrome runs in the
-  // background): the only surface that mints fresh __Secure-*PSIDTS values.
-  // NotebookLM app traffic never rotates PSIDTS, so without this poke the
-  // freshness partner dies within hours and every batchexecute call degrades
-  // to null wrb.fr frames (upstream_null). A 200 also proves the SID family is
-  // still good: PSIDTS is re-mintable from it even after it fully lapses, so a
-  // session that looks dead to RPC pings may still recover here.
-  // Port of notebooklm-py's keepalive contract (POST [000,"-...0"], 60s-class
-  // cadence), minus their master-token minting paths we don't have.
   async rotateCookies(): Promise<RotateCookiesOutcome> {
-    // Google rejects RotateCookies when the jar sends no PSIDTS at all; nothing
-    // else in the flow can re-mint it, so there is no point POSTing empty-handed.
-    const hasPsidts = [...this.cookieJar.keys()].some((name) => name.endsWith("PSIDTS"));
-    if (!hasPsidts) return { result: "skipped" };
-    // Snapshot before the fetch: upstreamFetch captures Set-Cookie into the jar
-    // inline, so a post-fetch snapshot would already contain the rotation.
-    const jarBefore = this.getCookieHeader();
-    const jarBeforeMap = new Map(this.cookieJar);
-    const response = await this.upstreamFetch(ROTATE_COOKIES_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "cookie": this.getCookieHeader(),
-        "origin": "https://accounts.google.com"
-      },
-      body: '[000,"-0000000000000000000"]'
-    });
-    if (!response.ok) {
-      // A 401 can mean either ordinary credential rejection or a DBSC
-      // challenge (Sec-Session-Google-Challenge header — Google demanding a
-      // signed device-bound rotation our stateless worker cannot produce).
-      // The distinction decides the fix, so record which one Google sent.
-      const detail = response.headers.get("sec-session-google-challenge") ? "dbsc_challenge" : "rejected";
-      console.warn(`NotebookLM RotateCookies failed status=${response.status} detail=${detail}`);
-      return { result: "failed", status: response.status, detail };
+    const hasBinding = this.jar.has("OSID") || this.jar.has("APISID") && this.jar.has("SAPISID");
+    const eligible = this.jar.has("SID") && (hasBinding || this.jar.has("__Secure-1PSIDTS") || this.jar.has("__Secure-3PSIDTS"));
+    if (!eligible || Date.now() < this.rotationNotBefore) {
+      this.observe({ event: "rotation", outcome: "skipped", reason: eligible ? "throttled" : "missing_rotation_binding", inventory: this.getInventory() });
+      return { result: "skipped" };
     }
-    const body = await response.text();
-    // Do NOT use isLoginUrl here: every RotateCookies response lives on
-    // accounts.google.com, which isLoginUrl treats as sign-in (upstreamFetch
-    // also skips jar capture for it). Only a real login path or a login-shaped
-    // body means the session is dead.
-    if (isLoginRedirectPath(response.url) || looksLikeGoogleLogin(body)) return { result: "expired", status: response.status };
-    this.rotationMint.clear();
-    this.rotationDeleted.clear();
-    this.captureSetCookies(response.headers);
-    for (const [name, value] of this.cookieJar) if (jarBeforeMap.get(name) !== value) this.rotationMint.set(name, value);
-    for (const name of jarBeforeMap.keys()) if (!this.cookieJar.has(name)) this.rotationDeleted.add(name);
-    return { result: this.getCookieHeader() === jarBefore ? "unchanged" : "rotated", status: response.status };
-  }
-
-  // Apply only the RotateCookies changes on top of a base jar: minted values
-  // are set, poke-deleted names removed, every other entry left exactly as the
-  // base has it. Unlike a jar snapshot this can never resurrect names a
-  // concurrent call deleted from the store.
-  applyRotationMint(baseHeader: string): string {
-    const cookies = parseCookieHeader(baseHeader);
-    for (const name of this.rotationDeleted) cookies.delete(name);
-    for (const [name, value] of this.rotationMint) cookies.set(name, value);
-    return [...cookies.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
-  }
-
-  async validateAuthentication(): Promise<void> {
+    this.rotationNotBefore = Date.now() + 60_000;
+    await this.onRotateAttempt?.();
+    const before = new Map(this.getCookieJar().map((c) => [cookieIdentity(c), c]));
+    let outcome: RotateCookiesOutcome;
     try {
-      await this.listNotebooks();
-      return;
-    } catch (error) {
-      if (!this.validationRpcId || !this.validationFReq) throw error;
-    }
-    if (this.validationRpcId && this.validationFReq) {
-      await this.rpcCall(this.validationRpcId, undefined, { fReq: this.validationFReq });
-      return;
-    }
+      const response = await this.upstreamFetch(ROTATE_COOKIES_URL, { method: "POST", headers: { "content-type": "application/json", "origin": "https://accounts.google.com" }, body: '[000,"-0000000000000000000"]' }, "rotation");
+      const body = await response.text();
+      if (!response.ok) outcome = { result: "failed", status: response.status, detail: response.headers.get("sec-session-google-challenge") ? "dbsc_challenge" : "rejected" };
+      else if (isLoginRedirectPath(this.http.lastUrl) || looksLikeGoogleLogin(body)) {
+        this.http.discardFinalCookies();
+        outcome = { result: "expired", status: response.status };
+      } else {
+        outcome = { result: "unchanged", status: response.status };
+      }
+    } catch (error) { outcome = { result: "failed", detail: error instanceof NotebookLMError ? error.reason : "network" }; }
+    const after = this.getCookieJar();
+    const changed = after.filter((c) => JSON.stringify(before.get(cookieIdentity(c))) !== JSON.stringify(c));
+    const deleted = [...before.keys()].some((key) => !after.some((c) => cookieIdentity(c) === key));
+    const jarChanged = changed.length > 0 || deleted;
+    if (outcome.result === "unchanged" && jarChanged) outcome.result = "rotated";
+    outcome.psidtsChanged = changed.some((c) => ["__Secure-1PSIDTS", "__Secure-3PSIDTS"].includes(c.name) && before.get(cookieIdentity(c))?.value !== c.value);
+    this.lastRotation = outcome;
+    this.observe({ event: "rotation", outcome: outcome.result, status: outcome.status, reason: outcome.detail, psidtsChanged: outcome.psidtsChanged, inventory: this.getInventory() });
+    // Persist a successful mint before subsequent RPCs can fail, time out or
+    // outlive the runtime. Storage failure must not become a nonfatal poke.
+    if (jarChanged) await this.onRotation?.();
+    return outcome;
   }
+  // A copied RPC may mutate user data. Validate only with our read-only list.
+  async validateAuthentication(): Promise<void> { await this.listNotebooks(); }
 
   async listNotebooks(): Promise<NotebookSummary[]> {
     const result = await this.rpcCall(rpcMethods.listNotebooks, [null, 1, null, [2]]);
@@ -362,8 +299,10 @@ export class NotebookLMClient {
   async askNotebook(input: { notebookId: string; question: string; sourceIds?: string[]; conversationId?: string }): Promise<AskResult> {
     const parsed = z.object({ notebookId: z.string().trim().min(1), question: z.string().trim().min(1).max(20_000), sourceIds: z.array(z.string().trim().min(1)).max(100).optional(), conversationId: z.string().trim().min(1).optional() }).parse(input);
     const sourceIds = parsed.sourceIds ?? (await this.listSources(parsed.notebookId)).map((source) => source.id);
-    const bootstrap = await this.bootstrap();
     const conversationId = parsed.conversationId ?? await this.getLastConversationId(parsed.notebookId) ?? crypto.randomUUID();
+    // Conversation lookup may recover authentication. Obtain the chat tokens
+    // afterwards so a preceding recovery cannot invalidate this submission.
+    const bootstrap = await this.bootstrap();
     const params = [nestSourceIds(sourceIds, 2), parsed.question, null, [2, null, [1]], conversationId];
     const body = new URLSearchParams();
     body.set("f.req", JSON.stringify([null, JSON.stringify(params)]));
@@ -374,10 +313,19 @@ export class NotebookLMClient {
     url.searchParams.set("hl", "en");
     url.searchParams.set("_reqid", String(Date.now() % 100000));
     url.searchParams.set("rt", "c");
+    this.applyAccountRoute(url);
     const response = await this.upstreamFetch(url.toString(), { method: "POST", headers: this.rpcHeaders(), body: `${body.toString()}&` });
-    if (!response.ok) throw new Error("NotebookLM chat request failed");
-    const parsedChat = parseChatResponse(await response.text());
-    return { answer: parsedChat.answer, conversationId, references: parsedChat.references };
+    if (!response.ok) await this.classifyAccessFailure(response);
+    if (!response.ok) throw new NotebookLMError("NotebookLM chat request failed", response.status === 401 ? "auth_expired" : response.status === 403 ? "access_denied" : "upstream_http", { status: response.status, reason: "chat_rejected" });
+    if (isLoginUrl(this.http.lastUrl) || isHtmlResponse(response)) { this.http.discardFinalCookies(); throw new NotebookLMError("NotebookLM chat requires sign-in", "auth_expired", { reason: "chat_login_response" }); }
+    try {
+      const parsedChat = parseChatResponse(await response.text());
+      return { answer: parsedChat.answer, conversationId, references: parsedChat.references };
+    } catch (error) {
+      this.http.discardFinalCookies();
+      if (error instanceof NotebookLMError) throw error;
+      throw new NotebookLMError("NotebookLM chat response parse failed", "upstream_parse");
+    }
   }
 
   async getLastConversationId(notebookId: string): Promise<string | null> {
@@ -491,6 +439,28 @@ export class NotebookLMClient {
   }
 
   private async rpcCall(rpcId: string, params: unknown[] | undefined, options: { allowNull?: boolean; fReq?: string; sourcePath?: string } = {}): Promise<unknown> {
+    try { return await this.rpcCallOnce(rpcId, params, options); }
+    catch (error) {
+      const failure = error instanceof NotebookLMError ? error : undefined;
+      const readOnly = new Set<string>([rpcMethods.listNotebooks, rpcMethods.getNotebook, rpcMethods.getSource, rpcMethods.getSourceGuide, rpcMethods.getNotesAndMindMaps, rpcMethods.listArtifacts, rpcMethods.getLastConversationId, rpcMethods.getConversationTurns, rpcMethods.pollResearch, rpcMethods.getShareStatus]);
+      const rejectedBeforeExecution = failure?.reason === "rpc_unauthenticated" || failure?.reason === "http_unauthenticated" || failure?.reason === "google_login";
+      const recoverable = failure?.stage === "auth_expired" && (readOnly.has(rpcId) || rejectedBeforeExecution) || failure?.stage === "auth_bootstrap_parse" || failure?.stage === "upstream_null" && readOnly.has(rpcId);
+      // Ambiguous nulls/network failures never blindly replay a mutation.
+      if (!recoverable || this.recovered) throw error;
+      this.recovered = true;
+      this.observe({ event: "recovery", outcome: "started", reason: failure?.reason, stage: failure?.stage, attempt: 1 });
+      await this.rotateCookies();
+      try {
+        const result = await this.rpcCallOnce(rpcId, params, options);
+        this.observe({ event: "recovery", outcome: "success", attempt: 1 });
+        return result;
+      } catch (retryError) {
+        this.observe({ event: "recovery", outcome: "failed", reason: retryError instanceof NotebookLMError ? retryError.reason : "runtime", attempt: 1 });
+        throw retryError;
+      }
+    }
+  }
+  private async rpcCallOnce(rpcId: string, params: unknown[] | undefined, options: { allowNull?: boolean; fReq?: string; sourcePath?: string }): Promise<unknown> {
     const bootstrap = await this.bootstrap();
     const url = new URL(`${this.baseUrl}/_/LabsTailwindUi/data/batchexecute`);
     url.searchParams.set("rpcids", rpcId);
@@ -498,6 +468,7 @@ export class NotebookLMClient {
     url.searchParams.set("f.sid", bootstrap.sessionId);
     url.searchParams.set("hl", "en");
     url.searchParams.set("rt", "c");
+    this.applyAccountRoute(url);
 
     const rpcRequest = params === undefined ? undefined : [[[rpcId, JSON.stringify(params), null, "generic"]]];
     const body = new URLSearchParams();
@@ -510,17 +481,21 @@ export class NotebookLMClient {
       body: body.toString()
     });
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) {
-        throw new NotebookLMError("NotebookLM rejected the session", "auth_expired", { status: response.status });
+      await this.classifyAccessFailure(response);
+      if (response.status === 401) {
+        throw new NotebookLMError("NotebookLM rejected the session", "auth_expired", { status: response.status, reason: "http_unauthenticated" });
       }
+      if (response.status === 403) throw new NotebookLMError("NotebookLM access denied", "access_denied", { status: 403 });
       throw new NotebookLMError("NotebookLM request failed", "upstream_http", { status: response.status });
     }
-    if (isLoginUrl(response.url) || isHtmlResponse(response)) {
-      throw new NotebookLMError("NotebookLM redirected to sign-in", "auth_expired");
+    if (isLoginUrl(this.http.lastUrl) || isHtmlResponse(response)) {
+      this.http.discardFinalCookies();
+      throw new NotebookLMError("NotebookLM redirected to sign-in", "auth_expired", { reason: "rpc_login_response" });
     }
     try {
       return extractRpcResult(parseNotebookLMResponse(await response.text()), rpcId, options);
     } catch (error) {
+      this.http.discardFinalCookies();
       if (error instanceof NotebookLMError) throw error;
       throw new NotebookLMError("NotebookLM response parse failed", "upstream_parse", { cause: error });
     }
@@ -530,58 +505,77 @@ export class NotebookLMClient {
     return { "content-type": "application/x-www-form-urlencoded;charset=UTF-8", "cookie": this.getCookieHeader(), "origin": this.baseUrl, "referer": `${this.baseUrl}/`, "x-same-domain": "1" };
   }
 
-  private async upstreamFetch(input: string | URL, init?: RequestInit): Promise<Response> {
-    const response = await this.fetchImpl(input, init);
-    // Sign-in pages may set allowlisted cookies for accounts.google.com — those belong
-    // to a different account context and must never enter the jar.
-    if (!isLoginUrl(response.url)) this.captureSetCookies(response.headers);
-    return response;
-  }
-
-  private captureSetCookies(headers: Headers | undefined): void {
-    const setCookies = headers?.getSetCookie?.() ?? [];
-    for (const raw of setCookies) {
-      const [pair, ...attributes] = raw.split(";");
-      const separator = pair.indexOf("=");
-      if (separator <= 0) continue;
-      const name = pair.slice(0, separator).trim();
-      const value = pair.slice(separator + 1).trim();
-      if (!notebookLmCookieAllowlist.has(name)) continue;
-      if (value && !isExpiredSetCookie(attributes)) this.cookieJar.set(name, value);
-      else this.cookieJar.delete(name);
+  private async upstreamFetch(input: string | URL, init?: RequestInit, phase?: "bootstrap" | "rpc" | "rotation" | "chat"): Promise<Response> {
+    try { return await this.http.request(input, init, phase ?? (String(input).includes("batchexecute") ? "rpc" : "chat")); }
+    catch (error) {
+      if (!(error instanceof AuthTransportError)) throw error;
+      const stage: NotebookLMFailureStage = error.reason === "timeout" ? "upstream_timeout" : error.reason === "cookie_mismatch" ? "cookie_mismatch" : error.reason === "access_gate" ? "access_denied" : error.reason === "network" ? "upstream_http" : "upstream_redirect";
+      throw new NotebookLMError("Google session transport failed", stage, { reason: error.reason });
     }
   }
-
+  private async classifyAccessFailure(response: Response): Promise<void> {
+    if ([401, 403].includes(response.status) && response.headers.get("sec-session-google-challenge")) throw new NotebookLMError("Google requested device-bound proof", "auth_challenge", { reason: "device_bound_challenge", status: response.status });
+    if (response.status === 403 && /recaptcha|g-recaptcha|unusual traffic/i.test(await response.text())) throw new NotebookLMError("Google requires an interactive challenge", "auth_challenge", { reason: "interactive_challenge", status: 403 });
+  }
+  private applyAccountRoute(url: URL): void {
+    const route = this.accountEmail ?? this.authuser;
+    if (route !== undefined) url.searchParams.set("authuser", String(route));
+  }
   private async bootstrap(): Promise<{ csrfToken: string; sessionId: string; buildLabel?: string }> {
-    try {
-      return await this.fetchFreshBootstrap();
-    } catch (error) {
-      if (error instanceof NotebookLMError && error.stage === "auth_expired") throw error;
-      if (this.copiedSessionId) return { csrfToken: this.copiedCsrfToken ?? "", sessionId: this.copiedSessionId };
-      throw error;
+    try { return await this.fetchFreshBootstrap(); }
+    catch (error) {
+      if (this.recovered || !(error instanceof NotebookLMError) || !["auth_expired", "auth_bootstrap_parse"].includes(error.stage)) throw error;
+      this.recovered = true;
+      this.observe({ event: "recovery", outcome: "started", phase: "bootstrap", reason: error.reason, attempt: 1 });
+      await this.rotateCookies();
+      try {
+        const result = await this.fetchFreshBootstrap();
+        this.observe({ event: "recovery", outcome: "success", phase: "bootstrap", attempt: 1 });
+        return result;
+      } catch (retryError) {
+        this.observe({ event: "recovery", outcome: "failed", phase: "bootstrap", reason: retryError instanceof NotebookLMError ? retryError.reason : "runtime", attempt: 1 });
+        throw retryError;
+      }
     }
   }
-
   private async fetchFreshBootstrap(): Promise<{ csrfToken: string; sessionId: string; buildLabel?: string }> {
-    const response = await this.upstreamFetch(`${this.baseUrl}/`, {
-      headers: { cookie: this.getCookieHeader() }
-    });
+    const url = new URL(`${this.baseUrl}/`);
+    this.applyAccountRoute(url);
+    const response = await this.upstreamFetch(url, {}, "bootstrap");
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) {
-        throw new NotebookLMError("NotebookLM rejected the session", "auth_expired", { status: response.status });
-      }
+      await this.classifyAccessFailure(response);
+      if (response.status === 401) throw new NotebookLMError("NotebookLM rejected the session", "auth_expired", { status: 401, reason: "http_unauthenticated" });
+      if (response.status === 403) throw new NotebookLMError("NotebookLM access denied", "access_denied", { status: 403 });
       throw new NotebookLMError("NotebookLM authentication failed", "auth_bootstrap_http", { status: response.status });
     }
-    this.adoptRedirectedBaseUrl(response.url);
+    this.adoptRedirectedBaseUrl(this.http.lastUrl);
     const html = await response.text();
-    if (isLoginUrl(response.url) || looksLikeGoogleLogin(html)) {
-      throw new NotebookLMError("NotebookLM session expired", "auth_expired");
+    if (isLoginUrl(this.http.lastUrl) || looksLikeGoogleLogin(html) && !extractWizField(html, "SNlM0e")) {
+      this.http.discardFinalCookies();
+      throw new NotebookLMError("NotebookLM session requires sign-in", "auth_expired", { reason: "google_login" });
     }
     const csrfToken = extractWizField(html, "SNlM0e") ?? "";
     const sessionId = extractWizField(html, "FdrFJe") ?? "";
-    if (!sessionId) throw new NotebookLMError("NotebookLM session bootstrap failed", "auth_bootstrap_parse");
-    const buildLabel = extractWizField(html, "cfb2h") ?? undefined;
-    return { csrfToken, sessionId, buildLabel };
+    if (!csrfToken || !sessionId) {
+      if (/recaptcha|g-recaptcha|unusual traffic/i.test(html)) throw new NotebookLMError("Google requires an interactive challenge", "auth_challenge", { reason: "interactive_challenge" });
+      // Google can serve a tokenless app shell for a signed-out session. Probe
+      // /login before labelling it a protocol/markup change (upstream #2038).
+      const login = new URL(`${this.baseUrl}/login`); this.applyAccountRoute(login);
+      const probe = await this.upstreamFetch(login, {}, "bootstrap");
+      if (!probe.ok) {
+        await this.classifyAccessFailure(probe);
+        if (probe.status === 401) throw new NotebookLMError("NotebookLM rejected the session", "auth_expired", { status: 401, reason: "http_unauthenticated" });
+        if (probe.status === 403) throw new NotebookLMError("NotebookLM access denied", "access_denied", { status: 403 });
+        throw new NotebookLMError("NotebookLM sign-in probe failed", "auth_bootstrap_http", { status: probe.status });
+      }
+      const body = await probe.text();
+      if (isLoginUrl(this.http.lastUrl) || looksLikeGoogleLogin(body)) {
+        this.http.discardFinalCookies();
+        throw new NotebookLMError("NotebookLM requires sign-in", "auth_expired", { reason: "google_login" });
+      }
+      throw new NotebookLMError("NotebookLM session bootstrap failed", "auth_bootstrap_parse", { reason: "missing_tokens" });
+    }
+    return { csrfToken, sessionId, buildLabel: extractWizField(html, "cfb2h") ?? undefined };
   }
 
   private adoptRedirectedBaseUrl(finalUrl: string | undefined): void {
@@ -713,6 +707,10 @@ function parseChatResponse(responseText: string): { answer: string; references: 
   let thinking = "";
   const references: AskResult["references"] = [];
   for (const chunk of chunks) {
+    const frames = Array.isArray(chunk) && Array.isArray(chunk[0]) ? chunk : [chunk];
+    for (const frame of frames) {
+      if (Array.isArray(frame) && frame[0] === "wrb.fr" && frame[2] === null) throwIfRpcAuthRejected(Array.isArray(frame[5]) ? frame[5][0] : undefined);
+    }
     const extracted = extractChatChunk(chunk);
     if (extracted.text) {
       if (extracted.isAnswer && extracted.text.length > answer.length) answer = extracted.text;
@@ -898,6 +896,11 @@ export function parseNotebookLMResponse(responseText: string): unknown[] {
   return chunks;
 }
 
+function throwIfRpcAuthRejected(status: unknown): void {
+  if (status === 16) throw new NotebookLMError("NotebookLM session rejected by upstream", "auth_expired", { reason: "rpc_unauthenticated", rpcStatus: 16 });
+  if (status === 7) throw new NotebookLMError("NotebookLM permission denied", "access_denied", { reason: "rpc_permission_denied", rpcStatus: 7 });
+}
+
 function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull?: boolean } = {}): unknown {
   let result: unknown;
   let sawNullPayload = false;
@@ -925,7 +928,7 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
     if (sawNullPayload) {
       // UNAUTHENTICATED can never tag a genuinely empty result, so it is raised
       // even for allowNull callers — reporting it as success hides a dead session.
-      if (nullStatus === 16) throw new NotebookLMError("NotebookLM session rejected by upstream", "auth_expired");
+      throwIfRpcAuthRejected(nullStatus);
       if (options.allowNull) {
         // Other status-tagged nulls are recorded on successful flows upstream,
         // so they still decode as empty — just not silently.
@@ -934,34 +937,11 @@ function extractRpcResult(chunks: unknown[], rpcId: string, options: { allowNull
         }
         return null;
       }
-      throw new NotebookLMError(`NotebookLM returned an empty result${nullStatus !== undefined ? ` (wrb status ${nullStatus})` : ""}`, "upstream_null");
+      throw new NotebookLMError(`NotebookLM returned an empty result${nullStatus !== undefined ? ` (wrb status ${nullStatus})` : ""}`, nullStatus === 7 ? "access_denied" : "upstream_null", { reason: nullStatus === 7 ? "rpc_permission_denied" : "rpc_null", rpcStatus: nullStatus });
     }
     throw new Error("NotebookLM response did not include expected RPC result");
   }
   return result;
-}
-
-// A Set-Cookie can delete a cookie with a nonempty value via Max-Age<=0 or a past
-// Expires date; both must remove the jar entry regardless of the value carried.
-function isExpiredSetCookie(attributes: string[]): boolean {
-  // RFC 6265: a present *valid* Max-Age takes precedence over Expires. An invalid
-  // Max-Age is ignored by browsers, so Expires still decides in that case.
-  let maxAgeSeen = false;
-  let expiresAt = Number.NaN;
-  for (const attribute of attributes) {
-    const [key, rawValue = ""] = attribute.split("=", 2);
-    const name = key.trim().toLowerCase();
-    const value = rawValue.trim();
-    if (name === "max-age") {
-      if (!/^-?\d+$/.test(value)) continue;
-      maxAgeSeen = true;
-      if (Number(value) <= 0) return true;
-    } else if (name === "expires") {
-      expiresAt = Date.parse(value);
-    }
-  }
-  if (maxAgeSeen) return false;
-  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
 }
 
 function isLoginRedirectPath(responseUrl: string | undefined): boolean {
@@ -1000,7 +980,9 @@ function extractWizField(html: string, key: string): string | null {
   ];
   for (const pattern of patterns) {
     const match = pattern.exec(html);
-    if (match?.[1] !== undefined) return match[1];
+    if (match?.[1] !== undefined) {
+      try { return JSON.parse(`"${match[1]}"`) as string; } catch { return match[1]; }
+    }
   }
   return null;
 }

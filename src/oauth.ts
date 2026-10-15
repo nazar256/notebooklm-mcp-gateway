@@ -1,10 +1,10 @@
 import { z } from "zod";
 import type { Env } from "./config";
-import { AuthArtifactError, formatCookieDiff, parseNotebookLMAuthArtifact } from "./authArtifact";
+import { AuthArtifactError, parseNotebookLMAuthArtifact } from "./authArtifact";
 import { accessTokenClaimsSchema, authCodeClaimsSchema, clientClaimsSchema, csrfClaimsSchema, decryptEnvelope, encryptEnvelope, pkceS256, refreshTokenClaimsSchema, sha256Base64Url, signJwt, verifyJwt, type EncryptedEnvelope } from "./crypto";
 import { parseUniqueUrlEncoded, readTextWithLimit } from "./http";
-import { NotebookLMClient, NotebookLMError } from "./notebooklm";
-import { loadSessionEnvelope, persistSessionEnvelope, persistSessionMint, seedSessionEnvelope } from "./sessionStore";
+import { NotebookLMError } from "./notebooklm";
+import { runSessionOperation } from "./sessionStore";
 import { baselineScope, formatScopes, grantScopesFromConsent, notebookLmScopes, parseGrantedScopes, parseRequestedScopes, scopeLabels, type NotebookLMScope } from "./scopes";
 
 const REGISTER_MAX_BYTES = 64_000;
@@ -161,13 +161,6 @@ export async function token(request: Request, env: Env): Promise<Response> {
   const challenge = await pkceS256(parsed.code_verifier);
   if (challenge !== ("code_challenge" in code ? code.code_challenge : code.p)) throw new Error("invalid_grant");
   const credential = resolveAuthCodeCredential(code);
-  try {
-    // Seed the session store at connect time so the shared jar covers
-    // this credential even before its first tool call or refresh exchange.
-    await seedSessionEnvelope(env, await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64), credential);
-  } catch {
-    // Seeding is best-effort; token issuance must not fail over KV.
-  }
   const ttlDays = "connector_ttl_days" in code ? code.connector_ttl_days : code.d;
   const scope = "scope" in code ? code.scope : code.s;
   const connectorExpiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString();
@@ -184,10 +177,7 @@ export async function authenticateMcp(request: Request, env: Env) {
   const claims = await verifyJwt(match[1], env.OAUTH_JWT_SIGNING_KEY_B64, env.OAUTH_ISSUER, env.MCP_AUDIENCE, accessTokenClaimsSchema);
   if (Date.parse(claims.connector_expires_at) <= Date.now()) throw new Error("expired_connector");
   const envelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
-  // The KV session store is authoritative for the rotating cookie jar; the
-  // token-carried envelope is only the fallback snapshot.
-  const stored = await loadSessionEnvelope(env, envelope.credId);
-  return { envelope: stored ? { ...envelope, cookieHeader: stored.cookieHeader } : envelope, scopes: parseGrantedScopes(claims.scope) };
+  return { envelope, scopes: parseGrantedScopes(claims.scope) };
 }
 
 export function mcpChallenge(env: Env, error?: "invalid_token"): Response {
@@ -294,52 +284,30 @@ async function refreshCredentialCookies(credential: EncryptedEnvelope, env: Env)
   if (env.MOCK_NOTEBOOKLM_LIST_JSON) return credential;
   try {
     const envelope = await decryptEnvelope(credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
-    // Seed the ping from the shared jar — it may be newer than the snapshot
-    // inside this refresh token, and persisting an older jar would regress it.
-    const stored = await loadSessionEnvelope(env, envelope.credId);
-    const safeFetch: typeof fetch = (input, init) => fetch(input, init);
-    const seedHeader = stored?.cookieHeader ?? envelope.cookieHeader;
-    const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: seedHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
-    const ping = await client.refreshCookies();
-    const cookieHeader = client.getCookieHeader();
-    // Message string carries the diagnostics: Cloudflare Observability does not
-    // index structured log arguments.
-    // Diff against the ping seed (KV jar when present), not the token snapshot:
-    // the token header can be older than KV, which would misattribute earlier
-    // rotations to this ping.
-    console.log(`NotebookLM credential refresh ping=${ping.outcome}${ping.stage ? ` stage=${ping.stage}` : ""}${ping.rotation ? ` rotation=${ping.rotation}${ping.rotationStatus ? `:${ping.rotationStatus}` : ""}${ping.rotationDetail ? `:${ping.rotationDetail}` : ""}` : ""} cred=${(envelope.credId ?? "-").slice(0, 8)} ${formatCookieDiff(seedHeader, cookieHeader)}`);
-    if (ping.outcome === "alive") {
-      // Persist the rotated jar into the shared session store so subsequent
-      // calls pick it up without waiting for the next token exchange.
-      await persistSessionEnvelope(env, envelope, client, seedHeader);
-    } else if (ping.outcome === "failed" && ping.rotation === "rotated") {
-      // Persist only the RotateCookies mint: it is valid by definition and must
-      // not be dropped (RotateCookies invalidates the values it replaces),
-      // while the rest of the failed exchange's captures may be poisoned.
-      await persistSessionMint(env, envelope, client);
-    }
-    if (!cookieHeader || cookieHeader === envelope.cookieHeader) return credential;
-    return await encryptEnvelope({ ...envelope, cookieHeader }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
-  } catch (error) {
-    console.warn(`NotebookLM credential refresh failed error=${error instanceof Error ? error.name : "unknown"}`);
+    const result = await runSessionOperation(env, envelope, { kind: "refresh" });
+    // OAuth lifetime and Google health are independent. Preserve our refresh
+    // grant while returning the latest jar, even after exhausted Google recovery.
+    return await encryptEnvelope(result.envelope, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
+  } catch {
+    console.warn('NotebookLMAuth event=refresh outcome=failed reason=session_owner_unavailable');
     return credential;
   }
 }
-
 
 async function validateNotebookLMCredentials(envelope: ReturnType<typeof parseNotebookLMAuthArtifact>, env: Env): Promise<string | null> {
   if (env.MOCK_NOTEBOOKLM_LIST_JSON) {
     z.array(z.object({ id: z.string(), title: z.string() })).parse(JSON.parse(env.MOCK_NOTEBOOKLM_LIST_JSON));
     return null;
   }
-  const safeFetch: typeof fetch = (input, init) => fetch(input, init);
-  const client = new NotebookLMClient({ baseUrl: envelope.baseUrl, cookieHeader: envelope.cookieHeader, sessionId: envelope.sessionId, csrfToken: envelope.csrfToken, validationRpcId: envelope.validationRpcId, validationFReq: envelope.validationFReq, fetch: safeFetch });
   try {
-    await client.validateAuthentication();
+    const result = await runSessionOperation(env, envelope, { kind: "connect" });
+    if (!result.ok) return `NotebookLM connection failed (${result.error?.stage}, ${result.error?.reason}). Trace ID: ${result.traceId}. Confirm the browser session is signed in and copy a fresh request.`;
+    // Validation may rotate cookies. Carry its actual result into the code.
+    Object.assign(envelope, result.envelope);
     return null;
   } catch (error) {
-    const stage = error instanceof NotebookLMError ? ` (${error.stage})` : "";
-    return `NotebookLM rejected the pasted credentials${stage}. Open NotebookLM in the same browser, confirm you are signed in, then copy a fresh batchexecute request with Copy as cURL.`;
+    const stage = error instanceof NotebookLMError ? error.stage : "session_store";
+    return `NotebookLM connection failed (${stage}). Session storage must be available before connecting.`;
   }
 }
 

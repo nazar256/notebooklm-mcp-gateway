@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { env, fetchWorker, issueAccessToken, sampleCookie } from "./helpers";
 
-const readTools = ["download_artifact", "get_conversation_turns", "get_last_conversation_id", "get_notebook", "get_share_status", "get_source_content", "get_source_guide", "list_artifacts", "list_notebooks", "list_notes", "list_sources", "poll_research"];
+const readTools = ["get_auth_status", "download_artifact", "get_conversation_turns", "get_last_conversation_id", "get_notebook", "get_share_status", "get_source_content", "get_source_guide", "list_artifacts", "list_notebooks", "list_notes", "list_sources", "poll_research"].sort();
 const chatTools = ["ask_notebook", "generate_artifact", "start_research"];
 const writeTools = ["add_drive_source", "add_text_source", "add_url_source", "add_youtube_source", "create_note", "create_notebook", "import_research_sources", "refresh_source", "rename_notebook", "update_note"];
 const deleteTools = ["delete_note", "delete_notebook", "delete_source"];
@@ -88,7 +88,7 @@ describe("MCP", () => {
     const response = await fetchWorker("/mcp", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list", params: {} }) });
     const body = await response.json() as { result?: { tools?: Array<{ name: string; description?: string; inputSchema?: unknown; outputSchema?: unknown; annotations?: Record<string, unknown> }> } };
     const tools = body.result?.tools ?? [];
-    expect(tools).toHaveLength(29);
+    expect(tools).toHaveLength(30);
     for (const tool of tools) {
       expect(tool.description).toEqual(expect.any(String));
       expect(String(tool.description).length).toBeGreaterThan(20);

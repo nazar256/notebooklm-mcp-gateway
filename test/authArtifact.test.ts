@@ -6,7 +6,7 @@ describe("auth artifact parser", () => {
   it("parses Copy-as-cURL with single-quoted -H cookie", () => {
     const parsed = parseNotebookLMAuthArtifact(`curl 'https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute' -H 'cookie: ${sampleCookie}'`);
     expect(parsed.source).toBe("copy-as-curl");
-    expect(parsed.cookieHeader).toBe(sampleCookie);
+    expect(parsed.cookieHeader).toContain(sampleCookie);
   });
 
   it("parses Copy-as-cURL with double-quoted -H cookie", () => {
@@ -22,23 +22,23 @@ describe("auth artifact parser", () => {
     expect(parseNotebookLMAuthArtifact(`curl 'https://notebooklm.google.com' -b '${sampleCookie}'`).cookieHeader).toBe(sampleCookie);
   });
 
-  it("preserves copied batchexecute bootstrap values", () => {
+  it("does not retain copied bootstrap tokens or RPC request bodies", () => {
     const parsed = parseNotebookLMAuthArtifact(`curl 'https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=ozz5Z&f.sid=-4302171918860766934&rt=c' -b '${sampleCookie}' --data-raw 'f.req=%5B%5D&at=ABn2ubcVPZyE7CvcSpffrN4k1qte%3A1781023951170&'`);
-    expect(parsed.sessionId).toBe("-4302171918860766934");
-    expect(parsed.csrfToken).toBe("ABn2ubcVPZyE7CvcSpffrN4k1qte:1781023951170");
-    expect(parsed.validationRpcId).toBe("ozz5Z");
-    expect(parsed.validationFReq).toBe("[]");
+    expect(parsed.sessionId).toBeUndefined();
+    expect(parsed.csrfToken).toBeUndefined();
+    expect(parsed.validationRpcId).toBeUndefined();
+    expect(parsed.validationFReq).toBeUndefined();
   });
 
   it("parses raw cookie header", () => {
     expect(parseNotebookLMAuthArtifact(sampleCookie).source).toBe("raw-cookie-header");
   });
 
-  it("drops non-NotebookLM cookie names from parsed artifacts", () => {
+  it("preserves host-scoped cookies without broadening their domain", () => {
     const parsed = parseNotebookLMAuthArtifact(`${sampleCookie}; analytics_cookie=tracking; __cf_bm=proxy`);
-    expect(parsed.cookieHeader).toBe(sampleCookie);
-    expect(parsed.cookieHeader).not.toContain("analytics_cookie");
-    expect(parsed.cookieHeader).not.toContain("__cf_bm");
+    expect(parsed.cookieHeader).toContain(sampleCookie);
+    expect(parsed.cookieJar?.find((c) => c.name === "analytics_cookie")).toMatchObject({ domain: "notebooklm.google.com", hostOnly: true, inferred: true });
+    expect(parsed.cookieJar?.find((c) => c.name === "__cf_bm")).toMatchObject({ domain: "notebooklm.google.com", hostOnly: true });
   });
 
   it("parses raw cookie header with cookie prefix", () => {
@@ -54,7 +54,6 @@ describe("auth artifact parser", () => {
   it("detects notebook.google.com from Copy-as-cURL", () => {
     const parsed = parseNotebookLMAuthArtifact(`curl 'https://notebook.google.com/_/LabsTailwindUi/data/batchexecute?rpcids=ZwVcOc&f.sid=-1&rt=c' -b '${sampleCookie}' --data-raw 'f.req=%5B%5D&at=token%3A1&'`);
     expect(parsed.baseUrl).toBe("https://notebook.google.com");
-    expect(parsed.validationRpcId).toBe("ZwVcOc");
   });
 
   it("detects notebook.google.com from curl --url form", () => {

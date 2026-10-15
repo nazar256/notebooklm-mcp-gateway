@@ -2,7 +2,7 @@
 
 Unofficial TypeScript Cloudflare Worker that exposes a remote Streamable HTTP MCP gateway for NotebookLM.
 
-The gateway lets an MCP client complete OAuth against the Worker, paste a fresh NotebookLM browser request artifact during authorization, and then call NotebookLM through MCP tools. The Worker is intentionally stateless: NotebookLM browser credentials are encrypted into signed OAuth/MCP token artifacts and are not stored in KV, Durable Objects, D1, R2, cache, or the filesystem.
+The gateway lets an MCP client complete OAuth against the Worker, paste a fresh NotebookLM browser request artifact during authorization, and then call NotebookLM through MCP tools. OAuth artifacts remain self-contained. Google session cookies are maintained in an encrypted SQLite-backed Durable Object, which serializes rotation, requests, and persistence. Existing KV sessions migrate lazily. Everything runs on Cloudflare Workers; users only need their browser.
 
 ## Important disclaimer
 
@@ -22,7 +22,9 @@ See [SECURITY.md](SECURITY.md) before deploying or connecting real accounts.
 - OAuth Authorization Code + PKCE for public clients.
 - Dynamic Client Registration at `POST /register`.
 - Short-lived MCP bearer access tokens and stateless refresh tokens bounded by the selected connector expiration.
-- Encrypted NotebookLM credential envelopes inside signed OAuth artifacts.
+- Encrypted NotebookLM credential envelopes inside signed OAuth artifacts and authoritative Durable Object storage.
+- Domain/path-aware cookies, explicit Google redirects, throttled rotation, and bounded auth recovery ported from notebooklm-py v0.8.5.
+- `get_auth_status` exposes safe recovery counters and cookie-presence diagnostics without contacting Google.
 - Supports consumer hosts `notebooklm.google.com` and `notebook.google.com` (Gemini Notebook redirect), plus `notebooklm.cloud.google.com`.
 - Server-enforced OAuth/MCP scopes so users can grant read-only or selected chat/write/delete/share capabilities at consent time.
 - Zod-backed MCP input/output schemas and `structuredContent` on successful tool calls.
@@ -34,7 +36,7 @@ See [SECURITY.md](SECURITY.md) before deploying or connecting real accounts.
 The current MCP tool surface covers notebooks, sources, chat, notes, Studio artifacts, research, and sharing:
 
 ```text
-list_notebooks, get_notebook, create_notebook, rename_notebook, delete_notebook,
+get_auth_status, list_notebooks, get_notebook, create_notebook, rename_notebook, delete_notebook,
 list_sources, add_url_source, add_youtube_source, add_text_source, add_drive_source,
 get_source_guide, get_source_content, refresh_source, delete_source,
 ask_notebook, get_last_conversation_id, get_conversation_turns,
@@ -44,7 +46,7 @@ start_research, poll_research, import_research_sources,
 get_share_status, set_share_public
 ```
 
-See [docs/TOOLS.md](docs/TOOLS.md) for read/write/destructive markers and known limitations.
+See [docs/TOOLS.md](docs/TOOLS.md) for tool contracts and [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) for the session port, limitations, evidence, and rollout requirements.
 
 ## OAuth and MCP scopes
 
@@ -76,6 +78,7 @@ npm ci
 npm run dev
 npm test
 npm run typecheck
+npm run test:runtime
 ```
 
 `npm run dev` uses dummy local-only signing/encryption values and localhost OAuth issuer/resource/audience overrides. Never reuse those values in a deployed Worker.

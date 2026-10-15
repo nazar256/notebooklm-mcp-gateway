@@ -21,15 +21,18 @@ The repository ignores common local artifact names, including `curl_request.sh`,
 
 ## Credential model
 
-The Worker does not store NotebookLM credentials in KV, Durable Objects, D1, R2, cache, or the filesystem. Instead, it encrypts a compact credential envelope into signed JWT artifacts.
+NotebookLM credentials are AES-GCM encrypted in signed OAuth artifacts and the authoritative session Durable Object. Legacy encrypted KV entries are read only during migration. Cookie values, Google challenges, notebook content, and tokens never enter auth diagnostics. Session owner identifiers use a domain-separated HMAC; raw SID and unkeyed SID hashes are not logged.
 
-This keeps deployment simple and stateless, but it has important consequences:
+OAuth artifacts remain self-contained, with these consequences:
 
 - authorization codes are replayable until their short expiration;
 - refresh tokens cannot be revoked or replay-detected server-side before expiration;
 - OAuth/MCP scopes limit which tools this Worker exposes to a token, but every issued token still contains encrypted NotebookLM browser session material; protect even read-only tokens as sensitive account credentials;
 - rotating Worker signing/encryption secrets invalidates existing connector sessions;
-- if a user's browser session expires or is revoked by Google, the connector must be reauthorized with a fresh artifact.
+- if Google revokes the underlying session or requires interactive reauthentication, cookie refresh can be exhausted and the user may need a fresh browser artifact;
+- the service accepts cookies only for approved Google identity/app domains, rebuilds headers at each redirect, and blocks external redirects;
+- a cURL header has inferred cookie metadata. Exported storage state preserves actual domains, paths and expiration; installing a CLI is not required;
+- the in-memory session mode is explicitly for local development/tests. Production fails closed if the Durable Object is unavailable.
 
 ## Secret setup and rotation
 

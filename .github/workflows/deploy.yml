@@ -32,6 +32,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Runtime authentication checks
+        run: npm run test:runtime
+
   deploy:
     name: Deploy to Cloudflare Workers
     runs-on: ubuntu-latest

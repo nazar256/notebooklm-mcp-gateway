@@ -1,12 +1,12 @@
 # Decisions
 
-## ADR-001: Keep the Worker stateless
+## ADR-001: Keep the Worker stateless (superseded for session state by ADR-013)
 
 The gateway does not use KV, Durable Objects, D1, R2, cache, or filesystem storage for NotebookLM credentials or OAuth session state.
 
 This keeps deployment simple and avoids server-side credential persistence. The tradeoff is that authorization codes and refresh tokens cannot be revoked or replay-detected server-side before their JWT expiration.
 
-## ADR-002: Store NotebookLM credentials only as encrypted token envelopes
+## ADR-002: Store NotebookLM credentials only as encrypted token envelopes (storage location superseded by ADR-013)
 
 NotebookLM browser credentials are parsed during OAuth authorization, minimally validated, encrypted with AES-GCM, and embedded in signed JWT artifacts.
 
@@ -54,7 +54,7 @@ NotebookLM responses can contain private notebook/source/user data beyond the no
 
 The first public release does not implement per-tool OAuth scopes. Authorization grants access to the full MCP tool surface exposed by the Worker for the pasted NotebookLM browser session. Destructive and permission-changing actions remain guarded by explicit confirmation inputs. If future users need least-privilege consent, add a scoped grant model before widening deployment beyond self-hosted/experimental use.
 
-## ADR-011: Rotate NotebookLM cookies through the refresh-token envelope
+## ADR-011: Rotate NotebookLM cookies through the refresh-token envelope (superseded by ADR-013)
 
 Google rotates NotebookLM session cookies (`SIDCC`, `__Secure-*PSIDCC`, `__Secure-*PSIDTS` families) via `Set-Cookie` on upstream responses; a pasted Copy-as-cURL snapshot goes stale within days while the browser session keeps working. To stay within the stateless design (ADR-001), rotated cookies are persisted inside the encrypted credential envelope rather than server-side storage:
 
@@ -63,7 +63,7 @@ Google rotates NotebookLM session cookies (`SIDCC`, `__Secure-*PSIDCC`, `__Secur
 
 Sessions can still expire when no refresh happens inside Google's grace window, or when Google invalidates the underlying session. Those cases surface as distinct failure stages (`auth_expired` for sign-in redirects/HTML/401/403, `upstream_null` for required RPC frames with null payloads) instead of a generic `upstream_parse`.
 
-## ADR-012: Shared session jar in Workers KV
+## ADR-012: Shared session jar in Workers KV (superseded by ADR-013)
 
 ADR-011's stateless jar has a structural gap: the cookie jar lives only inside one invocation, so rotations captured during a call persist only when the MCP client happens to do a refresh-token exchange. Clients that rarely refresh leave every call starting from the stale token snapshot, and idle connectors die within Google's rotation grace window.
 
@@ -77,3 +77,32 @@ To close this, each parsed auth artifact now gets a stable `credId` (UUID) insid
 The scheduled keep-alive trigger this ADR originally shipped was later removed: production telemetry and the reference `notebooklm` CLI both show browser-copied sessions stay alive through days of idle without pinging, so rotation happens lazily on tool calls and refresh exchanges instead of a cron.
 
 This intentionally relaxes ADR-001: the Worker keeps no OAuth state (tokens are still fully self-contained) but does keep server-side *session* state. Old envelopes without `credId` simply keep working statelessly.
+
+## ADR-013: Port cookie-session management into a serialized Cloudflare owner
+
+Use notebooklm-py **v0.8.5** as the reference for the HTTP cookie-session path.
+Preserve the browser Copy-as-cURL workflow. Do not require local CLI login,
+master tokens, Python hosting, or an external infrastructure operator.
+
+Maintain cookie identities by name/domain/path. Preserve complete storage
+exports; label cURL-derived metadata as inferred. Rebuild the outgoing cookie
+header and collect accepted Set-Cookie on every approved Google redirect.
+Preserve account selection across bootstrap, RPC and chat. Probe a tokenless
+app shell through /login and never replay an arbitrary copied validation RPC.
+
+A SQLite-backed Durable Object owns each keyed Google-session identity and
+queues the complete load/rotate/request/save sequence. It awaits encrypted
+persistence before reporting success. KV is a one-time migration input. Keep
+accepted rotation/bridge updates even when a later RPC rejects the request;
+keep diagnostics rather than deleting the jar on the first auth error.
+
+Rotate on demand, with a durable 60-second attempt guard. Missing PSIDTS may
+be recoverable from SID plus secondary bindings. Use a single bounded auth
+recovery budget per tool invocation. Ambiguous null, HTML, timeout or network
+failure must not blindly replay a mutation; explicit authentication rejection
+can retry the rejected RPC. Do not retry an entire multi-step tool.
+
+Expose presence flags, recovery/rotation counters and typed failure reasons.
+Do not label one failed jar as proof that cURL auth is universally impossible.
+Headless-browser and master-token rungs are unavailable and reported as such.
+See AUTHENTICATION.md for the acceptance/evidence protocol.

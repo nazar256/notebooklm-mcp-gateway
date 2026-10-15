@@ -2,6 +2,7 @@ import { pkceS256 } from "../src/crypto";
 import worker from "../src/index";
 
 export const env = {
+  SESSION_STORE_MODE: "memory",
   OAUTH_JWT_SIGNING_KEY_B64: b64("oauth-signing-key-that-is-long-enough-for-hs256-tests"),
   NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64: b64Bytes(32),
   CSRF_SIGNING_KEY_B64: b64("csrf-signing-key-that-is-long-enough-for-hs256-tests"),

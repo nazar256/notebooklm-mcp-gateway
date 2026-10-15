@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { base64ToBytes, decryptEnvelope, encryptEnvelope, pkceS256, signJwt } from "../src/crypto";
 import { parseEnv } from "../src/config";
 import { buildNotebookLMRpcResponse, NotebookLMClient } from "../src/notebooklm";
-import { persistSessionEnvelope } from "../src/sessionStore";
+import { sessionKey } from "../src/sessionStore";
 import { env, fakeKv, fetchWorker, registerClient, sampleCookie } from "./helpers";
 
 async function authorizeAndExchange(scope: string, selectedScopes = scope) {
@@ -221,7 +221,7 @@ describe("OAuth", () => {
       }, liveEnv);
       const html = await response.text();
       expect(response.status).toBe(400);
-      expect(html).toContain("NotebookLM rejected the pasted credentials");
+      expect(html).toContain("NotebookLM connection failed");
       expect(html).toContain("auth_bootstrap_parse");
     } finally {
       globalThis.fetch = originalFetch;
@@ -300,8 +300,8 @@ describe("OAuth", () => {
       const url = String(input);
       const headers = new Headers();
       if (url.endsWith("/")) {
-        headers.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly");
-        headers.append("set-cookie", "SIDCC=rotated-sidcc; Path=/");
+        headers.append("set-cookie", "__Secure-1PSIDTS=rotated-ts; Expires=Thu, 01 Jan 2032 00:00:00 GMT; Path=/; Secure; HttpOnly; Domain=.google.com");
+        headers.append("set-cookie", "SIDCC=rotated-sidcc; Path=/; Domain=.google.com");
         headers.append("set-cookie", "unrelated_tracker=x; Path=/");
         return new Response(bootstrapHtml, { headers });
       }
@@ -316,7 +316,7 @@ describe("OAuth", () => {
       expect(envelope.cookieHeader).toContain("__Secure-1PSIDTS=rotated-ts");
       expect(envelope.cookieHeader).toContain("SIDCC=rotated-sidcc");
       expect(envelope.cookieHeader).toContain("SID=sid-test-value");
-      expect(envelope.cookieHeader).not.toContain("unrelated_tracker");
+      expect(envelope.cookieHeader).toContain("unrelated_tracker");
     } finally {
       vi.unstubAllGlobals();
     }
@@ -329,7 +329,7 @@ describe("OAuth", () => {
     const claims = decodeJwt(tokenBody.refresh_token) as { credential: Parameters<typeof decryptEnvelope>[0] };
     const tokenEnvelope = await decryptEnvelope(claims.credential, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64);
     // KV holds a newer jar than the refresh token's snapshot.
-    await persistSessionEnvelope(noMockEnv, tokenEnvelope, new NotebookLMClient({ baseUrl: tokenEnvelope.baseUrl, cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=kv-freshest`, fetch: (i, n) => fetch(i, n) }));
+    await kv.put(sessionKey(tokenEnvelope.credId!), JSON.stringify(await encryptEnvelope({ ...tokenEnvelope, cookieJar: undefined, cookieHeader: `${sampleCookie}; __Secure-1PSIDTS=kv-freshest` }, env.NOTEBOOKLM_CREDENTIAL_ENC_KEY_B64)));
 
     const seenCookies: string[] = [];
     const bootstrapHtml = `<!doctype html><script>{"SNlM0e":"csrf","FdrFJe":"sid"}</script>`;
