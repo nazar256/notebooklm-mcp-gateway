@@ -32,10 +32,10 @@ export async function handleMcpRequest(request: Request, env: Env, auth: { envel
         const cookieAgeDays = Math.floor((Date.now() - Date.parse(auth.envelope.createdAt)) / 86_400_000);
         // Message string carries the diagnostics: Cloudflare Observability does
         // not index structured log arguments.
-        console.warn(`NotebookLM tool failed tool=${def.name} stage=${failure.stage} status=${failure.status ?? "-"} traceId=${traceId} cookieAgeDays=${Number.isFinite(cookieAgeDays) ? cookieAgeDays : "-"} cred=${(auth.envelope.credId ?? "-").slice(0, 8)}`);
+        console.warn(`NotebookLM tool failed tool=${def.name} stage=${failure.stage} reason=${failure.reason ?? "-"} status=${failure.status ?? "-"} traceId=${traceId} cookieAgeDays=${Number.isFinite(cookieAgeDays) ? cookieAgeDays : "-"} cred=${(auth.envelope.credId ?? "-").slice(0, 8)}`);
         const hint = failureHint(failure.stage) + (def.annotations?.readOnlyHint === false && failure.stage !== "input_validation"
           ? " This operation may have partially completed. Inspect NotebookLM before retrying; do not repeat the whole operation blindly." : "");
-        return { isError: true, content: [{ type: "text", text: `NotebookLM ${def.name} failed at ${failure.stage}${failure.status ? ` (HTTP ${failure.status})` : ""}. Trace ID: ${traceId}. ${hint}` }] };
+        return { isError: true, content: [{ type: "text", text: `NotebookLM ${def.name} failed at ${failure.stage}${failure.reason ? ` (${failure.reason})` : ""}${failure.status ? ` (HTTP ${failure.status})` : ""}. Trace ID: ${traceId}. ${hint}` }] };
       }
     });
   }
@@ -74,8 +74,8 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-function describeFailure(error: unknown): { stage: string; status?: number } {
-  if (error instanceof NotebookLMError) return { stage: error.stage, status: error.status };
+function describeFailure(error: unknown): { stage: string; reason?: string; status?: number } {
+  if (error instanceof NotebookLMError) return { stage: error.stage, reason: error.reason, status: error.status };
   if (error instanceof z.ZodError) return { stage: "input_validation" };
   return { stage: "runtime" };
 }
